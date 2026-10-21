@@ -52,7 +52,7 @@ try {
   const screenshots = JSON.parse(await readFile(join(root, 'screenshots.json'), 'utf8'));
   assert.ok(Array.isArray(screenshots) && screenshots.length >= 1 && screenshots.length <= 8);
   for (const path of screenshots) {
-    assert.match(path, /^docs\/images\/[\w-]+\.png$/);
+    assert.match(path, /^docs\/images\/[\w-]+\.(?:png|jpe?g|webp)$/);
     assert.ok(files.includes(path), 'Missing public screenshot');
   }
   assert.equal(manifest.name, 'dsh-cache-helper');
