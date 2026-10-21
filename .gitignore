@@ -1,0 +1,51 @@
+# Dependencies and generated packages. Keep package-lock.json tracked.
+node_modules
+.pnpm-store/
+lib/
+dist/
+*.tgz
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
+!.env.*.example
+.dsh
+.credentials.yaml
+.credentials.yml
+.npmrc
+.gitconfig
+.git-credentials
+.netrc
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Private sessions, diagnostics, and generated test / release output.
+/.local/
+/private/
+/sessions/
+/diagnostics/
+/screenshots/
+/test-output/
+/test-results/
+/playwright-report/
+/coverage/
+/artifacts/
+/release/
+/release-artifacts/
+/.release/
+/.release-source.json
+/out/
+/tmp/
+/.cache/
+session.v*.jsonl*
+web-state.json
+*.log
+
+# Editor and OS files.
+.DS_Store
+*.swp
+.idea/
+.vscode/

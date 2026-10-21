@@ -1,0 +1,4 @@
+# Self-developed experiment: only install into the web profile.
+- insert:
+    - id: cache-helper
+      name: dsh-cache-helper
