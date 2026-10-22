@@ -5,15 +5,17 @@ import { GateController, GateError } from './gate.mjs';
 import { SessionRepository, liveRecords, requestRevision } from './repository.mjs';
 import { inspectNextRequest } from './analysis.mjs';
 import { latestReceiptSeq } from './history.mjs';
+import { PolicyStore } from './policy.mjs';
+import { OperationController } from './operations.mjs';
 
 export const name = 'cache-helper';
 export const inject = ['llm', 'sessions', 'webServer', 'connection'];
 export const Config = z.object({
-  minLostTokens: z.natural().min(1).default(50000),
-  minLossRatio: z.number().min(0).max(1).default(0.2),
-  dashboardLimit: z.natural().min(1).max(200).default(50),
-  maxEvents: z.natural().min(1).default(200000),
-  maxCachedSessions: z.natural().min(1).max(200).default(64),
+  minLostTokens: z.natural().min(1).max(Number.MAX_SAFE_INTEGER).default(50000).volatile().description('旧前缀预计损失 Token 下限'),
+  minLossRatio: z.number().min(0).max(1).default(0.2).volatile().description('旧前缀预计损失比例下限'),
+  dashboardLimit: z.natural().min(1).max(200).default(50).volatile().description('最近活跃会话扫描上限'),
+  maxEvents: z.natural().min(1).max(Number.MAX_SAFE_INTEGER).default(200000).volatile().description('单会话事件读取上限'),
+  maxCachedSessions: z.natural().min(1).max(200).default(64).volatile().description('派生指标内存缓存会话数'),
 });
 
 function configOf(config) {
@@ -54,16 +56,31 @@ function json(res, status, value) {
 }
 
 export async function createCacheHelper(ctx, userConfig = {}) {
-  const config = configOf(userConfig);
+  let config = configOf(userConfig);
+  const policy = new PolicyStore(config);
+  config = { ...config, ...policy.snapshot().values };
   const gate = new GateController();
   const repository = new SessionRepository(ctx, config);
   await repository.init();
+  const operations = new OperationController(ctx, {
+    gate, persistState: config.persistState,
+    policy: () => ({ version: policy.snapshot().version, ...policy.snapshot().values }),
+    ...(config.operationStatePath ? { statePath: config.operationStatePath } : {}),
+  });
+  await operations.init();
+  repository.operations = () => operations.list();
   const disposers = [];
   let disposed = false;
   const api = {
-    gate, repository,
+    gate, repository, policy, operations,
+    updateResolvedConfig: next => {
+      const snapshot = policy.updateResolvedConfig(configOf(next));
+      config = { ...config, ...snapshot.values };
+      repository.updatePolicy(config, snapshot.version);
+      return snapshot;
+    },
     getSession: async sessionId => {
-      try { return { ...await repository.session(sessionId), pending: gate.pendingFor(sessionId) }; }
+      try { return { ...await repository.session(sessionId), pending: gate.pendingFor(sessionId), operation: operations.forSession(sessionId) }; }
       catch (error) {
         const pending = gate.pendingFor(sessionId);
         if (!pending) throw error;
@@ -76,11 +93,12 @@ export async function createCacheHelper(ctx, userConfig = {}) {
         };
       }
     },
-    dashboard: () => repository.dashboard(),
+    dashboard: query => repository.dashboard(query),
     dispose: async () => {
       if (disposed) return;
       disposed = true;
       gate.dispose();
+      await operations.dispose();
       for (const dispose of disposers.reverse()) await dispose();
       await repository.dispose();
     },
@@ -88,6 +106,8 @@ export async function createCacheHelper(ctx, userConfig = {}) {
 
   disposers.push(ctx.on('llm/stream', async function* (options, next) {
     if (disposed) throw new GateError('缓存插件已卸载，请重新发送。');
+    const strategy = policy.snapshot();
+    const requestConfig = { ...config, ...strategy.values };
     if (isAgentLoopRequest(options) && !options.purpose) {
       const session = ctx.sessions.get(options.sessionId);
       if (!session) throw new GateError('缓存检查无法读取当前会话，已阻止发送。', 'CACHE_HELPER_SESSION_UNAVAILABLE');
@@ -97,10 +117,10 @@ export async function createCacheHelper(ctx, userConfig = {}) {
         const contentGeneration = session.surface.contentGeneration;
         let risk;
         try {
-          if (records.length - 1 > config.maxEvents) throw new Error('Session exceeds the cache analysis event limit');
+          if (records.length - 1 > requestConfig.maxEvents) throw new Error('Session exceeds the cache analysis event limit');
           const info = await ctx.llm.resolveModelInfo(options.provider, options.model, options.signal);
           risk = await inspectNextRequest(records, options, {
-            ...config, toolUpdate: info.toolUpdate, systemPromptUpdate: info.systemPromptUpdate,
+            ...requestConfig, toolUpdate: info.toolUpdate, systemPromptUpdate: info.systemPromptUpdate,
             messageProjections: ctx.sessions.messageProjections ?? [],
           });
         } catch (error) {
@@ -117,7 +137,7 @@ export async function createCacheHelper(ctx, userConfig = {}) {
               ({ turn, step } = records[index].data); break;
             }
           }
-          await gate.wait(risk, {
+          await gate.wait({ ...risk, policy: strategy }, {
             sessionId: session.id, fingerprint: fingerprint(options, revision), turn, step, signal: options.signal,
             validate: () => ctx.sessions.get(session.id) === session
               && session.surface.contentGeneration === contentGeneration
@@ -146,7 +166,24 @@ export async function createCacheHelper(ctx, userConfig = {}) {
           if (!id || id.length > 200) return json(res, 400, { error: '缺少有效 sessionId。' });
           return json(res, 200, await api.getSession(id));
         }
-        if (req.method === 'GET' && path === '/dsh-cache-helper/api/dashboard') return json(res, 200, await api.dashboard());
+        if (req.method === 'GET' && path === '/dsh-cache-helper/api/dashboard') return json(res, 200, await api.dashboard({
+          period: url.searchParams.get('period') ?? '7d',
+          model: url.searchParams.get('model') || undefined,
+          provider: url.searchParams.get('provider') || undefined,
+        }));
+        if (req.method === 'GET' && path === '/dsh-cache-helper/api/operations/preview') {
+          return json(res, 200, await operations.preview(url.searchParams.get('sessionId')));
+        }
+        if (req.method === 'GET' && path === '/dsh-cache-helper/api/operations') {
+          return json(res, 200, url.searchParams.has('id')
+            ? operations.get(url.searchParams.get('id')) : operations.forSession(url.searchParams.get('sessionId')));
+        }
+        if (req.method === 'POST' && path === '/dsh-cache-helper/api/operations/start') {
+          return json(res, 200, await operations.start(await bodyOf(req)));
+        }
+        if (req.method === 'POST' && path === '/dsh-cache-helper/api/operations/cancel') {
+          return json(res, 200, await operations.cancel(await bodyOf(req)));
+        }
         if (req.method === 'POST' && path === '/dsh-cache-helper/api/decision') {
           const data = await bodyOf(req);
           return json(res, 200, gate.decide(data));
@@ -167,6 +204,7 @@ export async function createCacheHelper(ctx, userConfig = {}) {
 
 export async function apply(ctx, config) {
   const helper = await createCacheHelper(ctx, config);
+  ctx.on('loader/volatile-update', () => { helper.updateResolvedConfig(config); });
   ctx.effect(() => () => helper.dispose(), 'cache-helper: cancel pending requests on unload');
 }
 

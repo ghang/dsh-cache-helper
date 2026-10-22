@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reconstructCalls, reconstructCall, normalizeRequest, normalizeUsage } from '../src/history.mjs';
+import { reconstructCalls, reconstructCall, normalizeRequest, normalizeUsage, sessionAccounting } from '../src/history.mjs';
 import { fixture, tool, usage } from './history-fixtures.mjs';
 
 test('reconstruction includes assembled system, user and header after step/start; excludes current output', () => {
@@ -89,4 +89,59 @@ test('unsupported multimodal input is explicit and does not claim full coverage'
   const result = normalizeRequest(copy);
   assert.equal(result.comparable, false);
   assert.match(result.unknown, /image/);
+});
+
+test('auxiliary accounting uses recorded summary usage and keeps lifecycle duration distinct from model time', () => {
+  const records = [{ type: 'session', id: 'aux', isSeeded: false },
+    { type: 'compaction/start', seq: 0, time: 100, data: { compactionId: 'one', turn: null } },
+    { type: 'compaction/summary', seq: 1, time: 150, data: { compactionId: 'one',
+      provider: 'summary-provider', model: 'summary-model', llmStreamCall: true,
+      usage: usage(10, 90), summary: [{ type: 'text', text: 'private summary text' }],
+      rawOutput: [{ type: 'text', text: 'private raw output' }] } },
+    { type: 'compaction/end', seq: 2, time: 200, data: { compactionId: 'one', turn: null } },
+  ];
+  const result = sessionAccounting(records);
+  assert.equal(result.auxiliaryCalls.length, 1);
+  assert.equal(result.auxiliaryCalls[0].usage.cacheReadTokens, 90);
+  assert.equal(result.auxiliaryCalls[0].model, 'summary-model');
+  assert.equal(result.auxiliaryCalls[0].operationElapsedMs, 100);
+  assert.equal(result.auxiliaryCalls[0].modelDurationMs, null);
+  assert.equal(result.auxiliaryCalls[0].durationSource, 'compaction-lifecycle');
+  assert.equal(result.auxiliaryCalls[0].outcome, 'completed');
+  assert.equal(result.auxiliaryCalls[0].operationOutcome, 'completed');
+  assert.ok(!JSON.stringify(result).includes('private summary'));
+  assert.ok(!JSON.stringify(result).includes('private raw'));
+});
+
+test('unmarked template summaries and failed summaries never manufacture a zero-cost model receipt', () => {
+  const records = [{ type: 'session', id: 'aux', isSeeded: false },
+    { type: 'compaction/start', seq: 0, time: 100, data: { compactionId: 'template', turn: null } },
+    { type: 'compaction/summary', seq: 1, time: 150, data: { compactionId: 'template', provider: 'template', model: 'none' } },
+    { type: 'compaction/end', seq: 2, time: 200, data: { compactionId: 'template', turn: null } },
+    { type: 'compaction/start', seq: 3, time: 300, data: { compactionId: 'failed', turn: null } },
+    { type: 'compaction/end', seq: 4, time: 400, data: { compactionId: 'failed', turn: null, error: 'failed' } },
+    { type: 'compaction/summary', seq: 5, time: 450, data: { compactionId: 'known-call', provider: 'one', model: 'two', llmStreamCall: true } },
+  ];
+  const result = sessionAccounting(records);
+  assert.equal(result.auxiliaryCalls.length, 1);
+  assert.equal(result.auxiliaryCalls[0].usage.reported, false);
+  assert.equal(result.auxiliaryCalls[0].usage.cacheReadTokens, null);
+  assert.equal(result.auxiliaryCoverage.unrecorded.length, 2);
+  assert.equal(result.auxiliaryCoverage.complete, false);
+});
+
+test('seeded sessions require their exact inherited cutoff and empty attempts retain dispatch uncertainty', () => {
+  const records = [{ type: 'session', id: 'child', isSeeded: true, origin: 'subagent' },
+    { type: 'assistant/attempt', seq: 0, time: 1, data: { turn: 1, step: 1, stream: [] } },
+  ];
+  const unknown = sessionAccounting(records);
+  assert.equal(unknown.role, 'sub');
+  assert.equal(unknown.ownership.known, false);
+  assert.equal(unknown.emptyAttempts[0].inherited, null);
+  assert.equal(unknown.emptyAttempts[0].dispatch, 'unknown');
+  const inherited = sessionAccounting([{ ...records[0], inheritedEventCount: 1 }, records[1]]);
+  assert.equal(inherited.emptyAttempts[0].inherited, true);
+  for (const cutoff of [-1, 99]) {
+    assert.equal(sessionAccounting([{ ...records[0], inheritedEventCount: cutoff }, records[1]]).ownership.known, false);
+  }
 });

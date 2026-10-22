@@ -85,6 +85,8 @@ export function* iterateCalls(records, config = {}) {
       yield {
         turn: event.data?.turn, step: event.data?.step, seq: event.seq,
         at: event.time, settlement: event.type,
+        provider: event.data?.message?.source?.provider ?? header?.config?.provider ?? null,
+        model: event.data?.message?.source?.model ?? header?.config?.model ?? null,
         usage: normalizeUsage(eventUsage(event), {
           turn: event.data?.turn, step: event.data?.step, seq: event.seq,
         }),
@@ -101,6 +103,80 @@ export function* iterateCalls(records, config = {}) {
     }
     prefix.push(event);
   }
+}
+
+/** Read only recorded accounting facts; unknown auxiliary work is never free. */
+export function sessionAccounting(records) {
+  const { header, events } = splitRecords(records);
+  const suppliedCut = header?.inheritedEventCount;
+  const validCut = Number.isSafeInteger(suppliedCut) && suppliedCut >= 0 && suppliedCut <= events.length
+    && (header?.isSeeded === true || suppliedCut === 0);
+  const cut = validCut ? suppliedCut : suppliedCut !== undefined || header?.isSeeded ? null : 0;
+  const inherited = seq => cut === null ? null : seq < cut;
+  const starts = new Map();
+  const ends = new Map();
+  for (const event of events) {
+    if (event.type === 'compaction/start') starts.set(event.data?.compactionId, event);
+    if (event.type === 'compaction/end') ends.set(event.data?.compactionId, event);
+  }
+  const auxiliaryCalls = [];
+  const unrecorded = [];
+  const summaries = new Set();
+  for (const event of events) {
+    if (event.type !== 'compaction/summary') continue;
+    const data = event.data ?? {};
+    const start = starts.get(data.compactionId);
+    const end = ends.get(data.compactionId);
+    summaries.add(data.compactionId);
+    const position = { seq: event.seq, at: event.time, inherited: inherited(event.seq),
+      compactionId: data.compactionId ?? null, purpose: 'compaction',
+      provider: data.provider ?? null, model: data.model ?? null };
+    // An unmarked template/remote summary is not proof of an LLM call. A
+    // reported usage or an explicit stream-call witness is accounting evidence.
+    if (data.llmStreamCall !== true && data.usage === undefined) {
+      unrecorded.push({ ...position, reason: 'summary-without-call-receipt' });
+      continue;
+    }
+    const elapsed = start && end && Number.isFinite(start.time) && Number.isFinite(end.time)
+      && end.time >= start.time ? end.time - start.time : null;
+    auxiliaryCalls.push({ ...position, settlement: 'compaction/summary', role: 'auxiliary',
+      usage: normalizeUsage(data.usage),
+      operationElapsedMs: elapsed, durationSource: elapsed === null ? null : 'compaction-lifecycle',
+      modelDurationMs: null, // The lifecycle includes non-model work; do not relabel it.
+      outcome: 'completed', operationOutcome: end?.data?.error ? 'partial' : end ? 'completed' : 'pending',
+      recording: data.llmStreamCall === true ? 'local-stream' : 'reported-usage' });
+  }
+  for (const [id, start] of starts) {
+    if (summaries.has(id)) continue;
+    const end = ends.get(id);
+    unrecorded.push({ seq: start.seq, at: start.time, inherited: inherited(start.seq),
+      compactionId: id ?? null, purpose: 'compaction',
+      reason: end ? 'compaction-without-summary-receipt' : 'compaction-in-progress' });
+  }
+  return {
+    role: header?.origin === 'subagent' || header?.delegationDepth > 0 ? 'sub' : 'main',
+    ownership: { inheritedEventCount: cut, known: cut !== null },
+    auxiliaryCalls,
+    auxiliaryCoverage: { complete: false, unrecorded,
+      reason: '仅统计 Session 已记录的辅助回执；其他辅助调用及失败摘要可能没有用量记录。' },
+    emptyAttempts: events.filter(event => event.type === 'assistant/attempt'
+      && eventUsage(event) === undefined && !event.data?.stream?.length)
+      .map(event => ({ seq: event.seq, at: event.time, turn: event.data?.turn,
+        step: event.data?.step, inherited: inherited(event.seq), dispatch: 'unknown' })),
+    // A summary is log-only. Cache rebuilding is expected only after its
+    // adjacent, source-linked surface replacement actually changed history.
+    compactionSeqs: events.flatMap((event, index) => {
+      if (event.type !== 'compaction/summary') return [];
+      const replacement = events[index + 1];
+      const range = event.data?.shadowedRange;
+      const operation = replacement?.surfaceOp;
+      const start = starts.get(event.data?.compactionId);
+      return replacement?.type === 'user/message' && operation?.op === 'replace' && range && start
+        && operation.startSeq === range.start && operation.endSeq === range.end
+        && replacement.sourceEventSeqs?.includes(event.seq) && replacement.sourceEventSeqs?.includes(start.seq)
+        ? [replacement.seq] : [];
+    }),
+  };
 }
 
 /** Internal/testing API; callers must not expose raw request content in UI DTOs. */

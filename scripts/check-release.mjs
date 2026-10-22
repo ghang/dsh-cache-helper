@@ -101,7 +101,7 @@ try {
     const { symlink } = await import('node:fs/promises');
     await symlink(join(root, 'node_modules'), join(packageRoot, 'node_modules'), 'dir');
     run(process.execPath, ['--input-type=module', '-e', 'const p=await import("./lib/index.mjs"); if(typeof p.createCacheHelper!=="function" || typeof p.apply!=="function") process.exit(1);'], { cwd: packageRoot, capture: true });
-    artifactTests = tests(process.execPath, ['--test', '--test-reporter=tap', 'tests/integration.test.mjs', 'tests/client.test.mjs'], { ...process.env, DSH_CACHE_HELPER_TEST_ARTIFACT: packageRoot });
+    artifactTests = tests(process.execPath, ['--test', '--test-reporter=tap', 'tests/integration.test.mjs', 'tests/operations.test.mjs', 'tests/config-integration.test.mjs', 'tests/client.test.mjs', 'tests/client-next.test.mjs'], { ...process.env, DSH_CACHE_HELPER_TEST_ARTIFACT: packageRoot });
   } finally { await rm(scratch, { force: true, recursive: true }); }
   const sha256 = createHash('sha256').update(await readFile(stable)).digest('hex');
   assert.equal(await sourceDigest(root, await sourceFiles(root)), sourceSha256, 'Source changed during artifact verification');

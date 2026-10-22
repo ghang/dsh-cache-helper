@@ -47,7 +47,7 @@ npm run check:release
 
 ## 验证范围
 
-`npm test` 覆盖分析、Session 重建、确认门禁和持久化状态。集成测试使用锁定的 DSH 运行时向本机假上游发送 HTTP；测试密钥与内容均为合成数据，不需要真实模型凭据。
+`npm test` 覆盖分析、Session 重建、确认门禁、策略热更新、归属去重、辅助用量与受控操作。集成测试使用锁定的 DSH 运行时向本机假上游发送 HTTP；配置测试通过真实 Loader/SettingsForms/ConfigEditor 保存到临时 profile，操作测试通过真实 JSONL 持久化后独立重开分支。测试密钥与内容均为合成数据，不需要真实模型凭据。
 
 浏览器回归使用本项目的 Playwright、React 和前述显式安装的 Chromium。浏览器缺失或用例跳过不能算完整验收。用于布局的样式或最小夹具应位于独立源码内部，记录来源、版本和所需许可，不依赖本机其他仓库的相对路径。
 
@@ -75,7 +75,7 @@ node scripts/replay-session.mjs /absolute/path/session.v4.jsonl.zstd
 - `inputTokens`、`cacheReadTokens`、`cacheWriteTokens` 是互不重叠的计数。缺失字段保留未知，不补为零。
 - 未实际发送的空流取消不覆盖已知读数；实际末次回执缺少 usage 时保持未知，不沿用此前值。
 - 门禁绑定同一会话、候选指纹和历史版本，明确确认后只放行一次；停止、卸载或确认过期均不能发送。
-- 插件不注册模型工具、注入提示词、读取凭据或自动调用模型做原因分析。
+- 插件不注册模型工具、注入提示词、读取凭据或自动调用模型做原因分析。仅用户明确启动的分支压缩使用宿主摘要服务并记录实际用量；不自动续发主任务。
 
 ## 数据接口语义
 
@@ -88,6 +88,8 @@ node scripts/replay-session.mjs /absolute/path/session.v4.jsonl.zstd
 | `calls` | 按调用保留轮次、步骤、序号、用量和有限差异线索 |
 | `cumulative` | 会话累计指标；按输入 Token 加权，存在未知缓存字段时完整累计率保持未知 |
 | `warnings` | 旧前缀大规模实际 miss 的估计、观察到的差异和可能原因；恢复不会删掉历史 |
+| `role` / `ownership` | 主/子会话与继承事件归属；未知归属不进入全局已知用量 |
+| `auxiliaryCalls` / `auxiliaryCoverage` | 已记录摘要调用与未记录辅助操作的覆盖缺口；操作回执补充失败/取消调用时按分支和摘要标识去重 |
 | `coverage` | 已覆盖适配路径及重建未知情况，不能据此宣称覆盖所有模型和附件 |
 
 web 接口使用 DSH 现有浏览器认证，模型或 API operator 不能代替用户做费用确认：
@@ -95,11 +97,15 @@ web 接口使用 DSH 现有浏览器认证，模型或 API operator 不能代替
 | 方法与路径 | 请求或响应 |
 |---|---|
 | `GET /dsh-cache-helper/api/session?sessionId=...` | 会话指标与该会话 `pending`；分析失败时已有确认仍可见 |
-| `GET /dsh-cache-helper/api/dashboard` | 有扫描上限的会话概要及覆盖范围 |
+| `GET /dsh-cache-helper/api/dashboard` | `period=7d|30d|all`，可带 `model` / `provider`；返回有扫描上限的会话概要、专项统计、建议及覆盖范围 |
 | `POST /dsh-cache-helper/api/decision` | `{sessionId, id, fingerprint, decision}`；`decision` 只接受 `confirm` 或 `cancel`，旧确认返回失效状态 |
+| `GET /dsh-cache-helper/api/operations/preview?sessionId=...` | 只读准备一次受控分支压缩候选，返回能力与来源快照 |
+| `GET /dsh-cache-helper/api/operations?id=...` | 查询当前操作、分支与脱敏摘要回执 |
+| `POST /dsh-cache-helper/api/operations/start` | `{sessionId, id}`；同候选幂等，明确开始分支压缩 |
+| `POST /dsh-cache-helper/api/operations/cancel` | `{sessionId, id}`；取消后保留已经创建的分支 |
 | `POST /dsh-cache-helper/api/warnings/dismiss` | `{sessionId, id, dismissed}`；只改变指定会话中已存在告警的收起状态 |
 
-服务端状态文件只保存版本与告警收起 ID。浏览器的异常筛选只保存布尔值；不要把正文或凭据加入这些状态。
+服务端状态文件只保存版本与告警收起 ID。浏览器的异常筛选只保存布尔值；受控操作单独保存脱敏恢复元数据与实际摘要回执，不保存正文或凭据。配置值通过宿主 ConfigForms/ConfigEditor 保存，插件不另建配置文档。
 
 ## 修改后的最小回归
 
@@ -108,7 +114,11 @@ web 接口使用 DSH 现有浏览器认证，模型或 API operator 不能代替
 | 用量或分组 | 多轮、多步骤、末次未知、空流取消和加权累计 |
 | 请求重建或投影 | 生产适配器与假上游 wire 差分、system 更新、工具增删和 deferred 激活 |
 | 确认门禁 | 确认前零请求；确认一次只发送一次；取消、停止、卸载、历史变化和并发隔离 |
+| 热配置 | 真实保存与重启、无效配置、并发 revision 冲突、草稿保留、unset 继承默认、旧 pending 策略冻结 |
+| 专项统计 | 主/子继承去重、辅助回执去重、日期/模型筛选、未知用量、失败/取消/空尝试、预期重建与恢复截止时间 |
+| 分支压缩 | 等待空闲、来源/路由变化、重复点击、取消、真实分支持久化与重开、部分成功和进程重启；零自动续发 |
 | 界面 | 用量与时间之间的位置、原生用量按钮、窄窗、暗色、设置页和快捷看板 |
+| Context 联动 | 可选面板缺失/隐藏、延迟挂载、超时与卸载清理；会话级导航不冒充精确步骤定位 |
 | 发布文件 | 干净目录安装、包内入口、许可、相对链接、隐私扫描和旧包回滚 |
 
 安装验证只使用 web profile，放在任务间隙。先记录原版本和配置，保留回滚包，再试装候选；运行中的长会话不随意变更工具相关插件。

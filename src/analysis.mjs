@@ -1,5 +1,5 @@
 import {
-  iterateCalls, latestReceiptSeq, normalizeRequest, reconstructCall, splitRecords,
+  iterateCalls, latestReceiptSeq, normalizeRequest, reconstructCall, splitRecords, sessionAccounting,
 } from './history.mjs';
 
 export const DEFAULT_CONFIG = Object.freeze({ minLostTokens: 50_000, minLossRatio: 0.2 });
@@ -136,10 +136,18 @@ function cumulativeUsage(calls) {
 /** Public result contains metrics and limited cause metadata, never prompts. */
 export function analyzeSession(records, config = {}) {
   const resolved = setting(config);
+  const accounting = sessionAccounting(records);
+  const sessionId = splitRecords(records).header?.id ?? config.sessionId;
+  const inherited = seq => accounting.ownership.known ? seq < accounting.ownership.inheritedEventCount : null;
   const calls = [];
   const warnings = [];
   let previous;
+  let compactionIndex = 0;
+  let lastCompactionSeq = -1;
   for (const call of iterateCalls(records, config)) {
+    while (accounting.compactionSeqs[compactionIndex] < call.seq) {
+      lastCompactionSeq = accounting.compactionSeqs[compactionIndex++];
+    }
     const currentInput = normalizeRequest(call.request, config.historicalCapabilities ?? {});
     let difference;
     let warning;
@@ -158,8 +166,11 @@ export function analyzeSession(records, config = {}) {
           const observed = difference.changes.filter(change => change.kind !== 'unknown' && !change.preservesPrefix);
           const unknown = !currentInput.comparable || !previous.input.comparable;
           warning = {
-            id: `${splitRecords(records).header?.id ?? config.sessionId ?? 'session'}:${call.seq}`,
+            id: `${sessionId ?? 'session'}:${call.seq}`,
             turn: call.turn, step: call.step, seq: call.seq, at: call.at,
+            provider: call.provider, model: call.model, inherited: inherited(call.seq),
+            category: lastCompactionSeq > previous.call.seq
+              ? 'expected-rebuild' : 'unexpected-loss',
             usage: call.usage,
             inputTokens: call.usage.inputTokens, missTokens: call.usage.inputTokens,
             cacheReadTokens: call.usage.cacheReadTokens,
@@ -182,7 +193,8 @@ export function analyzeSession(records, config = {}) {
     }
     if (!warning && call.usage.hitRate !== null && call.usage.hitRate >= 0.8) {
       for (const old of warnings) {
-        if (!old.recovered && call.usage.cacheReadTokens >= old.previousPromptTokens * (1 - resolved.minLossRatio)) {
+        if (!old.recovered && old.provider === call.provider && old.model === call.model
+          && call.usage.cacheReadTokens >= old.previousPromptTokens * (1 - resolved.minLossRatio)) {
           old.recovered = true;
           old.recoveredAt = { seq: call.seq, turn: call.turn, step: call.step, at: call.at };
         }
@@ -190,6 +202,8 @@ export function analyzeSession(records, config = {}) {
     }
     calls.push({
       turn: call.turn, step: call.step, seq: call.seq, at: call.at,
+      provider: call.provider, model: call.model, inherited: inherited(call.seq),
+      category: warning?.category ?? (previous ? 'ordinary' : 'cold-start'),
       settlement: call.settlement, usage: call.usage,
       changes: difference?.changes ?? [],
       ...(warning ? { warningId: warning.id } : {}),
@@ -210,7 +224,10 @@ export function analyzeSession(records, config = {}) {
     ...(call.unknown ? { unknown: call.unknown } : {}),
   });
   return {
-    sessionId: splitRecords(records).header?.id ?? config.sessionId,
+    sessionId,
+    role: accounting.role, ownership: accounting.ownership,
+    auxiliaryCalls: accounting.auxiliaryCalls,
+    auxiliaryCoverage: accounting.auxiliaryCoverage, emptyAttempts: accounting.emptyAttempts,
     latest: calls.at(-1)?.usage ?? null,
     cumulative: cumulativeUsage(calls), calls, turns: [...turns.values()], warnings,
     coverage: { adapter: 'deepseek-messages-text', estimatedPrefixTokens: true,

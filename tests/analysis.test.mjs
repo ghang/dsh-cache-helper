@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { analyzeSession, compareRequests, inspectNextRequest } from '../src/analysis.mjs';
 import { normalizeRequest, reconstructCalls } from '../src/history.mjs';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { fixture, tool, usage } from './history-fixtures.mjs';
 
 test('normal tail growth, including a large input, has no predicted or actual old-prefix loss', () => {
@@ -230,4 +231,76 @@ test('nonempty failed final attempt with missing usage leaves its turn unknown',
   assert.equal(result.turns[0].latest.reported, false);
   assert.equal(result.turns[0].latest.cacheReadTokens, null);
   assert.equal(result.turns[0].latest.hitRate, null);
+});
+
+test('global DTO annotates call routing and exact inherited ownership without changing turn readings', () => {
+  const f = fixture();
+  const inherited = f.response(usage(100, 900));
+  f.next();
+  const own = f.response(usage(10, 990));
+  const records = f.records();
+  records[0] = { ...records[0], isSeeded: true, origin: 'subagent', inheritedEventCount: inherited.seq + 1 };
+  const result = analyzeSession(records);
+  assert.equal(result.role, 'sub');
+  assert.equal(result.calls[0].inherited, true);
+  assert.equal(result.calls[1].inherited, false);
+  assert.equal(result.calls[1].provider, f.config.provider);
+  assert.equal(result.calls[1].model, f.config.model);
+  assert.equal(result.turns[0].seq, own.seq);
+  assert.equal(result.latest.cacheReadTokens, 990);
+});
+
+test('expected post-compaction rebuilding is identified separately from unexpected loss', () => {
+  const f = fixture();
+  const old = f.response(usage(100, 100_000));
+  const replaced = f.session.snapshotEvents().filter(event => event.type === 'user/message' || event.type === 'assistant/message');
+  const start = f.session.append('compaction/start', { compactionId: 'compact', turn: 1 });
+  const summary = f.session.append('compaction/summary', { compactionId: 'compact',
+    provider: f.config.provider, model: f.config.model, usage: usage(50, 950), llmStreamCall: true,
+    rawOutput: [{ type: 'text', text: 'synthetic summary' }], summary: [{ type: 'text', text: 'synthetic summary' }],
+    shadowedRange: { start: replaced[0].seq, end: old.seq }, shadowedSeqs: replaced.map(event => event.seq), shadowedTokenCount: 100_000 });
+  f.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'synthetic summary' }] }), {
+    surfaceOp: { op: 'replace', startSeq: replaced[0].seq, endSeq: old.seq },
+    sourceEventSeqs: [start.seq, summary.seq, ...replaced.map(event => event.seq)],
+  });
+  f.session.append('compaction/end', { compactionId: 'compact', turn: 1 });
+  f.next(2, 1);
+  f.user('continue');
+  f.response(usage(60_000, 100));
+  const result = analyzeSession(f.records());
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.warnings[0].category, 'expected-rebuild');
+  assert.equal(result.calls.at(-1).category, 'expected-rebuild');
+  assert.equal(result.auxiliaryCalls.length, 1);
+  assert.equal(result.auxiliaryCalls[0].usage.cacheReadTokens, 950);
+});
+
+test('a high hit rate on another model is not recovery of an earlier route warning', () => {
+  const f = fixture();
+  f.response(usage(100, 100_000));
+  f.next(); f.response(usage(101_000, 100));
+  f.next(); f.config.model = 'deepseek-other'; f.header(f.tools);
+  f.response(usage(10, 200_000));
+  const result = analyzeSession(f.records());
+  assert.equal(result.warnings[0].model, 'deepseek-flash');
+  assert.equal(result.warnings[0].recovered, false);
+});
+
+test('a log-only summary whose replacement failed does not reclassify an unexpected miss', () => {
+  for (const closedWithError of [false, true]) {
+    const f = fixture();
+    const first = f.response(usage(100, 100_000));
+    f.session.append('compaction/start', { compactionId: 'failed-replacement', turn: 1 });
+    f.session.append('compaction/summary', { compactionId: 'failed-replacement',
+      provider: f.config.provider, model: f.config.model, llmStreamCall: true,
+      usage: usage(10, 900), summary: [{ type: 'text', text: 'summary not applied' }], rawOutput: [],
+      shadowedRange: { start: 2, end: first.seq }, shadowedSeqs: [2, first.seq], shadowedTokenCount: 100000 });
+    if (closedWithError) f.session.append('compaction/end', { compactionId: 'failed-replacement', turn: 1, error: 'replacement failed' });
+    f.next(2, 1); f.user('continue original history'); f.response(usage(100_000, 100));
+    const result = analyzeSession(f.records());
+    assert.equal(result.warnings.length, 1);
+    assert.equal(result.warnings[0].category, 'unexpected-loss');
+    assert.equal(result.calls.at(-1).category, 'unexpected-loss');
+    assert.equal(result.auxiliaryCalls.length, 1, 'Actual summary usage remains billable even when replacement fails');
+  }
 });

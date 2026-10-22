@@ -186,3 +186,68 @@ test('a message projection without surfaceOp invalidates the exact pending candi
     assert.equal(sent, 0);
   } finally { await helper.dispose(); }
 });
+
+test('a policy update invalidates settled metrics without changing authoritative usage', async () => {
+  const ctx = context([warnedSession('policy')]);
+  const original = settings();
+  const repo = new SessionRepository(ctx, original);
+  const before = await repo.session('policy');
+  assert.equal(before.warnings.length, 1);
+  repo.updatePolicy({ ...original, minLostTokens: 1_000_000 }, 2);
+  const after = await repo.session('policy');
+  assert.equal(after.warnings.length, 0);
+  assert.equal(after.policyVersion, 2);
+  assert.deepEqual(after.latest, before.latest);
+  assert.deepEqual(after.cumulative, before.cumulative);
+  assert.equal(ctx.analyses, 2);
+  await repo.dispose();
+});
+
+test('dashboard includes child-owned calls and separates filters and policy versions', async () => {
+  const main = warnedSession('main');
+  const sub = warnedSession('sub');
+  sub.header = { ...sub.header, origin: 'subagent', delegationDepth: 1 };
+  const original = settings();
+  const repo = new SessionRepository(context([main, sub]), original);
+  const all = await repo.dashboard({ period: 'all' });
+  assert.equal(all.sessions.length, 2);
+  assert.equal(all.statistics.groups.main.calls, 2);
+  assert.equal(all.statistics.groups.sub.calls, 2);
+  const absentModel = await repo.dashboard({ period: 'all', model: 'absent-model' });
+  assert.equal(absentModel.statistics.totals.calls, 0);
+  assert.equal(all.statistics.totals.warnings, 2);
+  repo.updatePolicy({ ...original, minLostTokens: 1_000_000 }, 2);
+  const next = await repo.dashboard({ period: 'all' });
+  assert.equal(next.statistics.totals.warnings, 0);
+  assert.equal(next.policyVersion, 2);
+  assert.deepEqual(next.statistics.totals.knownCacheReadTokens, all.statistics.totals.knownCacheReadTokens);
+  await assert.rejects(repo.dashboard({ period: 'forever' }), { status: 400 });
+  await repo.dispose();
+});
+
+test('dashboard exposes event-limit failures and activity-order fallbacks', async () => {
+  const repo = new SessionRepository(context([warnedSession('large')]), settings({ maxEvents: 1 }));
+  const result = await repo.dashboard({ period: 'all' });
+  assert.equal(result.coverage.scanned, 1);
+  assert.equal(result.coverage.included, 0);
+  assert.equal(result.coverage.errors[0].code, 'event-limit');
+  assert.equal(result.coverage.activityUnknown, 1);
+  assert.equal(result.statistics.totals.calls, 0);
+  await repo.dispose();
+});
+
+test('log-only auxiliary failures and empty attempts invalidate accounting coverage', async () => {
+  const f = fixture();
+  f.response(usage(100, 100_000));
+  const repo = new SessionRepository(context([f.session]), settings());
+  const before = await repo.session(f.session.id);
+  assert.equal(before.auxiliaryCoverage.unrecorded.length, 0);
+  f.session.append('compaction/start', { compactionId: 'failed-summary', turn: 1 });
+  f.session.append('compaction/end', { compactionId: 'failed-summary', turn: 1, error: 'synthetic failure' });
+  f.session.append('assistant/attempt', { turn: 1, step: 2, stream: [] });
+  const after = await repo.session(f.session.id);
+  assert.equal(after.auxiliaryCoverage.unrecorded.length, 1);
+  assert.equal(after.emptyAttempts.length, 1);
+  assert.deepEqual(after.latest, before.latest, 'Accounting coverage does not replace the latest actual receipt');
+  await repo.dispose();
+});
