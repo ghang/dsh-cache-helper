@@ -1,6 +1,6 @@
 # 开发说明
 
-开发、打包、安装验证和公开发布分别记录结果；本地测试通过不代表已经公开发行。发行状态以对应版本的 GitHub Release 为准。
+开发、打包、安装验证和公开发布分别记录结果；本地测试通过不代表已经公开发行。GitHub Release、npm、插件榜和本机安装来源分别核验，不能用一个渠道的成功替代另一个。
 
 ## 环境与目录
 
@@ -17,24 +17,33 @@
 | `lib/` | 构建结果；进入候选 tgz，不提交到源码 Git 历史 |
 | `.release/` | 候选校验产物和报告，不提交生成产物 |
 
-先在源码目录运行白名单导出，目标必须是尚不存在的新目录：
+## 已有独立仓库的日常开发
+
+本插件已经使用独立 Git 历史。后续开发从该仓库的新工作分支开始，保留现有提交、tag 和远端。不要每次迭代重新创建仓库或复制研究目录的 Git 历史。
+
+先检查当前 checkout、未提交变更、目标宿主版本和运行中的安装来源。若 `node_modules` 是宿主 profile 的软链，不能在此目录运行 `npm ci`；使用独立 checkout 或下节的干净候选目录。已有独立依赖时，日常按修改范围运行测试，需要构建时执行 `npm run build`。准备公开前再完成一次完整候选检查。
+
+## 生成发布候选
+
+为避免改变运行中的 web link，可以在唯一源码目录运行白名单导出，目标必须是尚不存在的新目录：
 
 ```bash
 npm run prepare:release -- --out /absolute/path/cache-helper-candidate
 cd /absolute/path/cache-helper-candidate
 npm ci --ignore-scripts --registry=https://registry.npmjs.org/
 npx --no-install playwright install chromium
-npm test
 npm run check:release
 ```
 
-`prepare:release` 仅复制白名单源码，不安装依赖或运行测试，也不创建 Git 仓库、提交、tag、远端或公开发行。依赖安装、浏览器准备和检查在导出的候选目录内完成。已有工作目录的 `node_modules` 若是宿主 profile 软链，不能在其中运行 `npm ci`；先导出，避免改变运行环境。
+`prepare:release` 仅复制白名单源码，不安装依赖或运行测试，也不创建 Git 仓库、提交、tag、远端或公开发行。候选是构建投影，不是第二份可编辑源码；修复回到唯一源码仓，再导出新目录。它不要求日常开发重新建立 Git 历史。独立、干净且没有宿主依赖软链的 checkout 也可直接运行候选检查。
 
 `npm ci --ignore-scripts` 按锁文件从指定公共 registry 准备开发依赖。`npx --no-install` 只运行已安装的 Playwright，浏览器下载由这个显式步骤完成。
 
-`check:release` 会运行完整测试、构建、打包、解包，并用解包后的产物再次做原生运行时与浏览器验证。通过后输出 `.release/dsh-cache-helper.tgz`、`.release/SHA256SUMS` 和 `.release/release-report.json`。实际通过、失败或跳过状态都要保留；检查拒绝 `node_modules` 软链及旧的宿主模块路径环境覆盖。
+`check:release` 内部已经执行完整 `npm test`，随后构建、打包、解包，并用解包后的产物再次做原生运行时与浏览器验证。标准候选流程不必在它前面重复运行一次完整测试。通过后输出 `.release/dsh-cache-helper.tgz`、`.release/SHA256SUMS` 和 `.release/release-report.json`。实际通过、失败或跳过状态都要保留；检查拒绝 `node_modules` 软链及旧的宿主模块路径环境覆盖。
 
-日常只构建时使用 `npm run build`。不要依赖宿主 profile 的 `node_modules` 软链作为独立源码的默认开发条件，也不要把个人电脑上可解析模块当成干净环境验证结果。
+这些脚本针对 cache-helper 的包名、入口、宿主兼容范围和测试集编写。其他插件可复用检查顺序和证据要求，但不能直接改包名后宣称通过同一套门禁。
+
+当前 CI 使用 Node 24，安装锁定依赖和 Chromium 后运行 `check:release`。它不执行真实仓库提交身份门禁、创建 Release、发布 npm 或提交插件榜。完整发布的入口与现有自动化边界见[发行流程](RELEASING.md)；统一发行命令尚未实现。
 
 ## 验证范围
 
@@ -104,4 +113,4 @@ web 接口使用 DSH 现有浏览器认证，模型或 API operator 不能代替
 
 安装验证只使用 web profile，放在任务间隙。先记录原版本和配置，保留回滚包，再试装候选；运行中的长会话不随意变更工具相关插件。
 
-公开源码采用独立白名单导出与新的 Git 历史。精确 noreply 身份、远端与发布授权见 [发布准备](RELEASING.md)。
+新插件首次从研究目录迁移公开时，才通过审核白名单建立独立历史；本插件的后续版本沿用现有仓库。精确 noreply 身份、远端、公共 npm 隔离和发布授权见[发行流程](RELEASING.md)。
