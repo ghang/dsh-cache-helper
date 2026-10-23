@@ -180,6 +180,38 @@ test('browser next: date and model charts use uppercase units and retain unknown
   assert.deepEqual(errors, []);
 });
 
+test('browser next: daily chart values appear immediately on hover and focus without native title delay', async t => {
+  const { page, errors } = await fixture(t, {
+    byDate: [{ date: '2026-10-22', calls: 20000, warnings: 1000 }, { date: 'unknown', calls: 0, warnings: null }],
+  });
+  await selectTab(page, '日期与模型');
+  const column = page.getByRole('img', { name: '2026-10-22：20,000 次调用，1,000 次异常', exact: true });
+  const tooltip = page.getByRole('tooltip');
+  await column.hover();
+  await tooltip.waitFor({ state: 'visible', timeout: 300 });
+  assert.match(await tooltip.innerText(), /2026-10-22\s+调用 20,000 次\s+异常 1,000 次/);
+  assert.equal(await page.locator('.dch-chart-scroll title').count(), 0, 'Native delayed tooltips must not overlay the immediate values');
+  await page.getByRole('heading', { name: '每日调用次数', exact: true }).hover();
+  await tooltip.waitFor({ state: 'detached', timeout: 300 });
+  await column.focus();
+  await tooltip.waitFor({ state: 'visible', timeout: 300 });
+  await column.press('Escape');
+  await tooltip.waitFor({ state: 'detached', timeout: 300 });
+  const unknown = page.getByRole('img', { name: '日期未知：0 次调用，未知 次异常', exact: true });
+  await unknown.focus();
+  await tooltip.waitFor({ state: 'visible', timeout: 300 });
+  assert.match(await tooltip.innerText(), /日期未知\s+调用 0 次\s+异常 未知 次/);
+  await page.setViewportSize({ width: 360, height: 900 });
+  await column.focus();
+  await unknown.focus();
+  await tooltip.waitFor({ state: 'visible', timeout: 300 });
+  const bounds = await tooltip.boundingBox();
+  assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= 360 && bounds.y >= 0 && bounds.y + bounds.height <= 900, 'Tooltip stays inside a narrow viewport');
+  await selectTab(page, '概览');
+  assert.equal(await tooltip.count(), 0, 'Tooltip must not leak into another tab');
+  assert.deepEqual(errors, []);
+});
+
 test('browser next: empty distributions show an explicit empty state instead of fabricated charts', async t => {
   const { page, errors } = await fixture(t, { byDate: [], byModel: [] });
   await selectTab(page, '日期与模型');

@@ -464,8 +464,26 @@ window.__ModuleLoader__.load({
           h('p', { className: 'dch-note' }, `冷启动 ${exact(total.coldStarts || 0)} 次 · 空尝试 ${exact(total.emptyAttempts || 0)} 次（发送状态未知） · 未记录辅助操作 ${exact(total.unrecordedAuxiliaryOperations || 0)} 次 · 归属未知 ${exact(coverage.ownershipUnknownCalls || 0)} 次 · 缺少时间 ${exact(coverage.unknownDateCalls || 0)} 次。辅助调用只覆盖已记录数据，未记录不代表零开销。`)));
     }
     function StatisticsCharts({ statistics }) {
+      const tooltipId = useId();
+      const [tooltip, setTooltip] = useState(null);
+      useEffect(() => { setTooltip(null); }, [statistics]);
+      useEffect(() => {
+        if (!tooltip) return;
+        const dismiss = () => { setTooltip(null); };
+        window.addEventListener('scroll', dismiss, true);
+        window.addEventListener('resize', dismiss);
+        return () => { window.removeEventListener('scroll', dismiss, true); window.removeEventListener('resize', dismiss); };
+      }, [Boolean(tooltip)]);
       const count = value => finite(value) && value >= 0 ? value : null;
       const dateLabel = value => value && value !== 'unknown' ? value : '日期未知';
+      const showTooltip = (event, row) => {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const x = finite(event.clientX) ? event.clientX : bounds.left + bounds.width / 2;
+        const y = finite(event.clientY) ? event.clientY : bounds.top;
+        setTooltip({ date: row.date, calls: count(row.calls), warnings: count(row.warnings),
+          left: Math.max(8, Math.min(x + 12, window.innerWidth - 188)),
+          top: Math.max(8, Math.min(y + 12, window.innerHeight - 96)) });
+      };
       const dates = (statistics?.byDate || []).slice().sort((a, b) => a.date === 'unknown' ? 1 : b.date === 'unknown' ? -1 : String(a.date).localeCompare(String(b.date)));
       const models = (statistics?.byModel || []).slice().sort((a, b) => (count(b.calls) ?? -1) - (count(a.calls) ?? -1));
       const max = Math.max(1, ...dates.flatMap(row => [count(row.calls) ?? 0, count(row.warnings) ?? 0]));
@@ -481,18 +499,25 @@ window.__ModuleLoader__.load({
             h('div', { className: 'dch-chart-legend' }, h('span', null, h('i', { className: 'dch-key-calls' }), '调用'), h('span', null, h('i', { className: 'dch-key-warnings' }), '异常'))),
           h('p', { className: 'dch-note' }, '查看调用量和异常出现的日期；悬停或聚焦柱形可查看精确值。'),
           dates.length ? h('div', { className: 'dch-chart-scroll' }, h('svg', { viewBox: `0 0 ${width} ${height}`, style: { minWidth: `${width}px` }, role: 'img', 'aria-label': '每日调用次数' },
-            h('title', null, '每日记录的调用次数与异常次数，日期按上海时间；未知日期单列。'),
+            h('desc', null, '每日记录的调用次数与异常次数，日期按上海时间；未知日期单列。'),
             ...Array.from({ length: 5 }, (_, index) => { const value = index * step, at = y(value); return h('g', { key: `grid-${index}`, className: 'dch-chart-grid' }, h('line', { x1: left, x2: width - 16, y1: at, y2: at }), h('text', { x: left - 8, y: at + 4, textAnchor: 'end' }, short(value))); }),
             ...dates.map((row, index) => {
               const calls = count(row.calls), warnings = count(row.warnings), x = left + stride * (index + 0.5);
               const label = `${dateLabel(row.date)}：${exact(calls)} 次调用，${exact(warnings)} 次异常`;
-              return h('g', { key: row.date || index, tabIndex: 0, role: 'img', 'aria-label': label, className: 'dch-date-column' },
-                h('title', null, label),
+              return h('g', { key: row.date || index, tabIndex: 0, role: 'img', 'aria-label': label, className: 'dch-date-column',
+                'aria-describedby': tooltip && tooltip.date === row.date ? tooltipId : undefined,
+                onPointerEnter: event => { showTooltip(event, row); }, onFocus: event => { showTooltip(event, row); },
+                onPointerLeave: event => { if (!event.currentTarget.matches(':focus')) setTooltip(null); },
+                onBlur: event => { if (!event.currentTarget.matches(':hover')) setTooltip(null); },
+                onKeyDown: event => { if (event.key === 'Escape') { event.stopPropagation(); setTooltip(null); } } },
+                h('rect', { x: x - stride / 2, y: top, width: stride, height: bottom + 27 - top, fill: 'transparent' }),
                 h('rect', { x: x - barWidth - 2, y: y(calls ?? 0), width: barWidth, height: bottom - y(calls ?? 0), rx: 3, className: 'dch-date-calls' }),
                 h('rect', { x: x + 2, y: y(warnings ?? 0), width: barWidth, height: bottom - y(warnings ?? 0), rx: 3, className: 'dch-date-warnings' }),
                 calls === null ? h('text', { x, y: bottom - 7, textAnchor: 'middle', className: 'dch-chart-unknown' }, '未知') : null,
                 h('text', { x, y: bottom + 23, textAnchor: 'middle', className: 'dch-chart-date' }, row.date && row.date !== 'unknown' ? row.date.slice(5) : '未知'));
-            }))) : h('p', { className: 'dch-chart-empty' }, '所选范围暂无日期记录')),
+            }))) : h('p', { className: 'dch-chart-empty' }, '所选范围暂无日期记录'),
+          tooltip ? createPortal(h('div', { id: tooltipId, role: 'tooltip', className: 'dch-chart-tooltip', style: { left: tooltip.left, top: tooltip.top } },
+            h('strong', null, dateLabel(tooltip.date)), h('span', null, `调用 ${exact(tooltip.calls)} 次`), h('span', null, `异常 ${exact(tooltip.warnings)} 次`)), document.body) : null),
         h('article', { className: 'dch-card dch-chart-card' }, h('h3', null, '模型调用分布'),
           h('p', { className: 'dch-note' }, '按已记录的调用次数比较；占比不代表 Token 或费用占比。'),
           models.length ? h('div', { className: 'dch-model-chart', role: 'img', 'aria-label': '模型调用分布' }, ...models.map((row, index) => {
@@ -838,7 +863,8 @@ body[data-ds-dark-theme] .dch-tag-warn{color:#d9a956}body[data-ds-dark-theme] .d
 .dch-metric,.dch-metric+.dch-metric,.dch-settings-dashboard .dch-metric:nth-child(n){border:1px solid var(--dch-line);border-radius:10px;padding:12px 15px;background:var(--dch-bg);gap:3px;min-width:0}.dch-metric>span{font-size:11px;color:var(--dch-secondary)}.dch-metric>strong{font-size:20px;font-weight:600;letter-spacing:-.3px;line-height:1.5;overflow-wrap:anywhere}.dch-metric>small{font-size:11px;line-height:1.5;color:var(--dch-secondary)}.dch-statistics{margin:0}
 .dch-data-notes{font-size:11px;color:var(--dch-secondary)}.dch-data-notes>summary{cursor:pointer;line-height:1.6;list-style-position:inside}.dch-data-notes>p{margin:8px 0 0}.dch-card.dch-data-notes{padding:10px 14px}.dch-coverage{margin:12px 0 0!important;padding-top:10px;border-top:1px solid var(--dch-line)}
 .dch-charts{min-width:0}.dch-chart-card{min-width:0}.dch-chart-legend{display:flex;gap:12px;font-size:11px;color:var(--dch-secondary)}.dch-chart-legend>span{display:inline-flex;align-items:center;gap:5px}.dch-chart-legend i{display:block;width:8px;height:8px;border-radius:2px}.dch-key-calls{background:var(--dch-blue)}.dch-key-warnings{background:var(--dch-amber)}
-.dch-chart-scroll{overflow-x:auto;min-width:0;max-width:100%;scrollbar-width:thin}.dch-chart-scroll svg{width:100%;height:220px;display:block;font:11px system-ui,sans-serif}.dch-chart-grid line{stroke:var(--dch-line);stroke-width:1}.dch-chart-grid text,.dch-chart-date,.dch-chart-unknown{fill:var(--dch-secondary)}.dch-date-calls{fill:var(--dch-blue)}.dch-date-warnings{fill:var(--dch-amber)}.dch-date-column{outline:none}.dch-date-column:hover rect,.dch-date-column:focus rect{stroke:var(--dsw-alias-label-primary,#252633);stroke-width:1.5}.dch-chart-empty{padding:40px 10px;text-align:center;color:var(--dch-secondary);font-size:12px}
+.dch-chart-scroll{overflow-x:auto;min-width:0;max-width:100%;scrollbar-width:thin}.dch-chart-scroll svg{width:100%;height:220px;display:block;font:11px system-ui,sans-serif}.dch-chart-grid line{stroke:var(--dch-line);stroke-width:1}.dch-chart-grid text,.dch-chart-date,.dch-chart-unknown{fill:var(--dch-secondary)}.dch-date-calls{fill:var(--dch-blue)}.dch-date-warnings{fill:var(--dch-amber)}.dch-date-column{outline:none}.dch-date-column:is(:hover,:focus) :is(.dch-date-calls,.dch-date-warnings){stroke:var(--dsw-alias-label-primary,#252633);stroke-width:1.5}.dch-chart-empty{padding:40px 10px;text-align:center;color:var(--dch-secondary);font-size:12px}
+.dch-chart-tooltip{position:fixed;z-index:2147483005;pointer-events:none;box-sizing:border-box;width:180px;max-width:calc(100vw - 16px);padding:9px 12px;border:1px solid var(--dsw-alias-border-l2,#e7e8ec);border-radius:8px;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-primary,#252633);box-shadow:0 4px 16px #0002;font:12px/1.6 system-ui,sans-serif}.dch-chart-tooltip>strong,.dch-chart-tooltip>span{display:block}.dch-chart-tooltip>strong{font-weight:600;margin-bottom:3px}
 .dch-model-chart{display:flex;flex-direction:column;gap:15px;max-height:280px;overflow-y:auto;padding:3px 1px}.dch-model-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:12px}.dch-model-name{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;font-weight:500}.dch-model-heading>.dch-dim{flex:none;font-size:11px;font-variant-numeric:tabular-nums}.dch-model-track{height:7px;border-radius:4px;background:var(--dch-soft);margin:6px 0 3px;overflow:hidden}.dch-model-fill{height:100%;display:block;border-radius:4px;background:var(--dch-blue)}.dch-model-unknown{background:var(--dsw-alias-label-tertiary,#a7abb6)}.dch-model-row small{font-size:11px}
 .dch-session-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:10px}.dch-session-toolbar>.dch-note{margin-left:auto}.dch-check{font-size:12px}.dch-check input{accent-color:var(--dch-primary)}
 .dch-dashboard-grid,.dch-settings-dashboard .dch-dashboard-grid{grid-template-columns:minmax(160px,.35fr) minmax(0,1fr);min-height:0;height:440px;border:1px solid var(--dch-line);border-radius:10px;background:var(--dch-bg)}
