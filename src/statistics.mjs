@@ -121,6 +121,7 @@ export function aggregateStatistics(sessions, options = {}) {
     unknownDateCalls: 0, unknownModelCalls: 0, dateFilteredOutCalls: 0, modelFilteredOutCalls: 0,
     auxiliaryRecordingComplete: false, emptyAttemptDispatchKnown: false,
     operationReceiptCalls: 0, operationReceiptsDuplicateExcluded: 0, operationsOutsideScanExcluded: 0,
+    operationSummaryRecordsUnconfirmed: 0,
     pendingAuxiliaryCalls: 0,
     unrecordedAuxiliaryOperations: 0, matchingSessions: 0,
     source: 'bounded-session-scan', onlyOwnedCalls: true };
@@ -133,6 +134,22 @@ export function aggregateStatistics(sessions, options = {}) {
   const recordedCompactions = new Set();
   const nonCallSeen = new Set();
   const matching = new Set();
+  const scannedIds = new Set(sessions.map(session => session.sessionId));
+  const scopedOperations = [];
+  const summaryStartTimes = new Map();
+  for (const operation of options.operations ?? []) {
+    if (!scannedIds.has(operation.sessionId) && !scannedIds.has(operation.branchId)) {
+      coverage.operationsOutsideScanExcluded++;
+      continue;
+    }
+    scopedOperations.push(operation);
+    if (typeof operation.branchId !== 'string') continue;
+    for (const receipt of operation.summaryCalls ?? []) {
+      if (receipt.atSource !== 'llm-stream-start' || receipt.llmStreamCall === false
+        || !timestamp(receipt.at) || !Number.isSafeInteger(receipt.summarySeq) || receipt.summarySeq < 0) continue;
+      summaryStartTimes.set(JSON.stringify([operation.branchId, receipt.summarySeq]), receipt.at);
+    }
+  }
   for (const session of sessions) {
     const sessionId = session.sessionId;
     const warnings = new Map((session.warnings ?? []).map(warning => [warning.seq, warning]));
@@ -140,7 +157,12 @@ export function aggregateStatistics(sessions, options = {}) {
       ...(session.calls ?? []).map(call => ({ call, role: ['main', 'sub'].includes(session.role) ? session.role : 'unknown' })),
       ...(session.auxiliaryCalls ?? []).map(call => ({ call, role: 'auxiliary' })),
     ];
-    for (const { call, role } of actual) {
+    for (const { call: sourceCall, role } of actual) {
+      const start = role === 'auxiliary' ? summaryStartTimes.get(JSON.stringify([sessionId, sourceCall.seq])) : undefined;
+      const call = role === 'auxiliary' ? { ...sourceCall,
+        at: start ?? sourceCall.at,
+        atSource: start === undefined ? sourceCall.atSource ?? 'session-summary-settlement' : 'llm-stream-start',
+        settledAt: sourceCall.at, settledAtSource: sourceCall.atSource ?? 'session-summary-settlement' } : sourceCall;
       const owns = ownership(session, call);
       if (owns === 'inherited') { coverage.inheritedCallsExcluded++; continue; }
       if (owns === 'unknown') { coverage.ownershipUnknownCalls++; continue; }
@@ -179,12 +201,8 @@ export function aggregateStatistics(sessions, options = {}) {
   // Operation-scoped receipts preserve failed/cancelled summary attempts that
   // have no compaction/summary event. Successful receipts share that event's
   // identity, so the operation ledger cannot bill the same summary twice.
-  const scannedIds = new Set(sessions.map(session => session.sessionId));
-  for (const operation of options.operations ?? []) {
-    if (!scannedIds.has(operation.sessionId) && !scannedIds.has(operation.branchId)) {
-      coverage.operationsOutsideScanExcluded++;
-      continue;
-    }
+  const sessionAuxiliaryReceiptGaps = allUnrecorded.length;
+  for (const operation of scopedOperations) {
     for (const [index, receipt] of (operation.summaryCalls ?? []).entries()) {
       if (receipt.outcome === 'started' && ['stopping', 'creating', 'compacting'].includes(operation.state)) {
         coverage.pendingAuxiliaryCalls++;
@@ -192,18 +210,39 @@ export function aggregateStatistics(sessions, options = {}) {
       }
       const sessionId = operation.branchId ?? operation.sessionId;
       const compactionId = receipt.compactionId ?? operation.compaction?.id;
-      if (compactionId) recordedCompactions.add(JSON.stringify([sessionId, compactionId]));
       const seq = Number.isSafeInteger(receipt.summarySeq) && receipt.summarySeq >= 0 ? receipt.summarySeq : null;
       const key = seq === null ? JSON.stringify(['operation', operation.id, index]) : JSON.stringify([sessionId, seq]);
+      const raw = receipt.usage;
+      // A durable summary can come from a local template or remote extension.
+      // Preserve that record as a coverage gap unless it witnesses a stream or
+      // reported usage. Legacy invocation receipts have no `source` marker.
+      if (receipt.source === 'session-summary' && receipt.llmStreamCall !== true
+        && receipt.usageRecorded !== true && !FIELDS.some(field => finite(raw?.[field]))) {
+        if (seen.has(key)) { coverage.operationReceiptsDuplicateExcluded++; continue; }
+        coverage.operationSummaryRecordsUnconfirmed++;
+        const gapKey = seq === null ? key : JSON.stringify(['auxiliary', sessionId, seq]);
+        if (!nonCallSeen.has(gapKey)) {
+          nonCallSeen.add(gapKey);
+          const call = { seq, at: receipt.at ?? null, provider: receipt.provider ?? null,
+            model: receipt.model ?? null, compactionId,
+            purpose: 'compaction', reason: 'summary-without-call-receipt' };
+          const row = { sessionId, call };
+          allUnrecorded.push(row);
+          if (dateMatches(call, filters) && modelMatches(call, filters)) unrecorded.push(row);
+        }
+        continue;
+      }
+      if (compactionId) recordedCompactions.add(JSON.stringify([sessionId, compactionId]));
       if (seen.has(key)) { coverage.operationReceiptsDuplicateExcluded++; continue; }
       seen.add(key);
-      const raw = receipt.usage;
       const usage = Object.fromEntries(FIELDS.filter(field => field !== 'promptTokens')
         .map(field => [field, finite(raw?.[field]) ? raw[field] : null]));
       usage.promptTokens = ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens'].every(field => usage[field] !== null)
         ? usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens : null;
       usage.reported = receipt.usageRecorded === true || Object.values(usage).some(value => finite(value));
-      const call = { seq, at: receipt.at ?? null, provider: receipt.provider ?? null, model: receipt.model ?? null,
+      const call = { seq, at: receipt.at ?? null, atSource: receipt.atSource ?? null,
+        settledAt: receipt.settledAt ?? null, settledAtSource: receipt.settledAtSource ?? null,
+        provider: receipt.provider ?? null, model: receipt.model ?? null,
         purpose: 'compaction', settlement: 'operation/summary', usage,
         outcome: receipt.outcome ?? 'unknown', operationId: operation.id,
         modelDurationMs: finite(receipt.durationMs) ? receipt.durationMs : null };
@@ -219,10 +258,18 @@ export function aggregateStatistics(sessions, options = {}) {
   }
   const recordedElsewhere = row => row.call.compactionId
     && recordedCompactions.has(JSON.stringify([row.sessionId, row.call.compactionId]));
-  coverage.sessionAuxiliaryReceiptGaps = allUnrecorded.length;
+  coverage.sessionAuxiliaryReceiptGaps = sessionAuxiliaryReceiptGaps;
   coverage.unrecordedAuxiliaryOperations = allUnrecorded.filter(row => !recordedElsewhere(row)).length;
   unrecorded = unrecorded.filter(row => !recordedElsewhere(row));
   coverage.matchingSessions = matching.size;
+  coverage.callTimeBasis = 'recorded-summary-stream-start-else-receipt-settlement';
+  coverage.callTimeSources = { summaryStreamStart: 0, receiptSettlement: 0, unknown: 0 };
+  for (const row of rows) {
+    const source = !timestamp(row.call.at) ? 'unknown'
+      : row.call.atSource === 'llm-stream-start' ? 'summaryStreamStart'
+        : row.role !== 'auxiliary' || row.call.atSource === 'session-summary-settlement' ? 'receiptSettlement' : 'unknown';
+    coverage.callTimeSources[source]++;
+  }
   const overall = totals(rows);
   overall.emptyAttempts = emptyAttempts.length;
   overall.unrecordedAuxiliaryOperations = unrecorded.length;

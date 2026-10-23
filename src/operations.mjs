@@ -379,6 +379,7 @@ export class OperationController {
         const compactionStart = child.session.snapshotEvents().slice(firstOwnEvent)
           .findLast(event => event.type === 'compaction/start');
         const call = { provider: options.provider, model: options.model, purpose: 'compaction',
+          llmStreamCall: true, source: 'llm-stream',
           usage: usageOf(undefined), at: begin, atSource: 'llm-stream-start',
           ...(compactionStart ? { compactionId: compactionStart.data.compactionId } : {}),
           durationMs: null, outcome: 'started', usageRecorded: false };
@@ -409,6 +410,7 @@ export class OperationController {
       };
       await this.#flushBranch(job, child);
       job.view.resultDurable = true;
+      signal.throwIfAborted();
       job.view.state = result === null ? 'noop' : 'completed';
       job.view.context.afterTokens = metering(this.ctx, child.session);
     } catch (error) {
@@ -425,10 +427,12 @@ export class OperationController {
             && item.model === event.data.model && item.summarySeq === undefined && item.outcome === 'completed'
             && (item.compactionId === undefined || item.compactionId === event.data.compactionId));
           const details = { provider: event.data.provider, model: event.data.model, usage: usageOf(event.data.usage),
-            summarySeq: event.seq, compactionId: event.data.compactionId };
+            summarySeq: event.seq, compactionId: event.data.compactionId,
+            settledAt: event.time, settledAtSource: 'session-summary-settlement' };
           if (call) Object.assign(call, details);
           else job.view.summaryCalls.push({ ...details, durationMs: null, outcome: 'completed',
             at: event.time, atSource: 'session-summary-settlement',
+            llmStreamCall: event.data.llmStreamCall === true,
             usageRecorded: event.data.usage !== undefined, source: 'session-summary' });
         }
         job.view.context.afterTokens = metering(this.ctx, child.session);

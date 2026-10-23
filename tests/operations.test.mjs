@@ -15,6 +15,8 @@ const testedModule = file => process.env.DSH_CACHE_HELPER_TEST_ARTIFACT
   : new URL(`../src/${file}`, import.meta.url).href;
 const { OperationController } = await import(testedModule('operations.mjs'));
 const { GateController } = await import(testedModule('gate.mjs'));
+const { analyzeSession } = await import(testedModule('analysis.mjs'));
+const { aggregateStatistics } = await import(testedModule('statistics.mjs'));
 const modules = await loadRuntime();
 const { default: TokenMeter } = await import('@deepseek-ai/dsh-token-meter');
 const { BasicCompactionEngine } = await import('@deepseek-ai/dsh-compaction-basic');
@@ -109,6 +111,9 @@ test('native fork + BasicCompactionEngine + DeepSeek HTTP preserve source, route
   assert.ok(result.summaryCalls[0].durationMs >= 0);
   assert.equal(result.summaryCalls[0].compactionId, result.compaction.id);
   assert.equal(result.summaryCalls[0].atSource, 'llm-stream-start');
+  assert.equal(result.summaryCalls[0].llmStreamCall, true);
+  assert.ok(result.summaryCalls[0].settledAt >= result.summaryCalls[0].at);
+  assert.equal(result.summaryCalls[0].settledAtSource, 'session-summary-settlement');
   assert.equal(child.status, 'idle');
   assert.equal(child.inbox.nextTurn.length + child.inbox.nextStep.length, 0);
   assert.equal(child.session.snapshotEvents().filter(e => e.type === 'turn/start' && e.seq >= child.session.inheritedEventCount).length, 0);
@@ -200,6 +205,58 @@ test('a final branch flush failure exposes partial rather than completed and pre
   assert.deepEqual(h.source.session.snapshotEvents(), original);
 });
 
+test('cancellation accepted during the final flush preserves the durable summary without reporting completion', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'cache-helper-final-flush-cancel-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const statePath = join(directory, 'operations.json');
+  const h = await harness(t, { statePath, persistState: true,
+    replies: [{ text: 'A durable summary completed before the user cancelled.' }] });
+  const original = h.source.session.snapshotEvents();
+  const release = Promise.withResolvers();
+  const flush = h.ctx.sessions.flush.bind(h.ctx.sessions);
+  let summaryFlushes = 0;
+  let waitingForFinalFlush = false;
+  h.ctx.sessions.flush = async session => {
+    if (session.header.parentSession === h.source.id
+      && session.snapshotEvents().some(event => event.type === 'compaction/summary')
+      && ++summaryFlushes === 2) {
+      waitingForFinalFlush = true;
+      await release.promise;
+    }
+    return flush(session);
+  };
+  try {
+    const preview = h.operations.preview(h.source.id);
+    const job = h.operations.start(preview);
+    await eventually(() => waitingForFinalFlush);
+    assert.equal(h.operations.get(job.id).state, 'compacting');
+    assert.equal(h.operations.cancel(job).cancelRequested, true);
+    release.resolve();
+    const result = await h.finished(job.id);
+    assert.equal(result.state, 'cancelled');
+    assert.equal(result.error.code, 'cancelled');
+    assert.equal(result.branchDurable, true);
+    assert.equal(result.resultDurable, true);
+    assert.ok(result.compaction);
+    assert.equal(result.summaryCalls.length, 1);
+    assert.equal(result.summaryCalls[0].outcome, 'completed');
+    assert.equal(result.summaryCalls[0].usageRecorded, true);
+    assert.equal(result.summaryCalls[0].usage.cacheReadTokens, 100000);
+    assert.deepEqual(h.source.session.snapshotEvents(), original);
+    const child = h.ctx.agents.get(result.branchId);
+    const reader = await h.ctx.sessionPersistence.open(result.branchId, 'read');
+    try {
+      assert.deepEqual((await reader.read()).events, child.session.snapshotEvents());
+    } finally { await reader.close(); }
+    const receipt = JSON.parse(await readFile(statePath, 'utf8')).jobs.find(item => item.id === job.id);
+    assert.equal(receipt.state, 'cancelled');
+    assert.equal(receipt.resultDurable, true);
+    assert.equal(h.operations.start(preview).state, 'cancelled');
+    assert.equal(h.operations.preview(h.source.id).id, job.id);
+    assert.equal(h.upstream.requests.length, 3);
+  } finally { release.resolve(); }
+});
+
 test('the first public terminal state is partial when a delayed final receipt rename fails', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'cache-helper-final-receipt-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -259,8 +316,18 @@ test('summary settlement fallback records its actual event time without inventin
   const summary = child.session.snapshotEvents().findLast(event => event.type === 'compaction/summary');
   assert.equal(result.summaryCalls.length, 1);
   assert.equal(result.summaryCalls[0].at, summary.time);
+  assert.equal(result.summaryCalls[0].settledAt, summary.time);
   assert.equal(result.summaryCalls[0].atSource, 'session-summary-settlement');
   assert.equal(result.summaryCalls[0].compactionId, summary.data.compactionId);
+  assert.equal(result.summaryCalls[0].llmStreamCall, false);
+  assert.equal(result.summaryCalls[0].usageRecorded, false);
+  const metrics = analyzeSession([{ type: 'session', ...child.session.header,
+    inheritedEventCount: child.session.inheritedEventCount }, ...child.session.snapshotEvents()]);
+  assert.equal(metrics.auxiliaryCalls.length, 0);
+  const statistics = aggregateStatistics([metrics], { period: 'all', operations: [result] });
+  assert.equal(statistics.groups.auxiliary.calls, 0, 'A template summary does not prove a model call');
+  assert.equal(statistics.totals.unrecordedAuxiliaryOperations, 1, 'Unconfirmed usage must remain a coverage gap');
+  assert.equal(statistics.coverage.operationSummaryRecordsUnconfirmed, 1);
   assert.equal(h.upstream.requests.length, 2);
 });
 

@@ -2,7 +2,7 @@
 
 为 DeepSeek Harness（DSH）显示实际缓存命中量，在发送前确认大规模缓存风险，并保留异常记录与会话统计看板。
 
-**当前工作源码：0.2.0-rc.1，尚未公开发行。** 已公开版本仍为 0.1.2，预构建安装包通过 [GitHub Releases](https://github.com/ghang/dsh-cache-helper/releases) 提供；npm 与插件榜收录分别记录。下面的配置热更新、专项统计、分支压缩与 Context 联动属于本次候选。已验证的宿主环境为 DSH `0.2.1-rc.2` 的 `web` profile；其他版本仍需验证。
+**当前工作源码：0.2.0-rc.2，尚未公开发行。** 已记录的公开版本为 0.1.2（2026-10-22 核对），预构建安装包通过 [GitHub Releases](https://github.com/ghang/dsh-cache-helper/releases) 提供；npm 与插件榜收录分别记录。下面的配置热更新、专项统计、分支压缩与 Context 联动属于本次候选。已验证的宿主环境为 DSH `0.2.1-rc.2` 的 `web` profile；其他版本仍需验证。
 
 ## 功能
 
@@ -53,7 +53,7 @@ DSH 的 `inputTokens` 是未缓存输入，输出不进分母。回答尾部只�
 
 ## 安装
 
-需要 Node.js 22 或更新版本，以及已安装的 DSH CLI。从 [Releases](https://github.com/ghang/dsh-cache-helper/releases) 下载对应版本的 `dsh-cache-helper.tgz` 和 `SHA256SUMS`，在两者所在目录执行 `shasum -a 256 -c SHA256SUMS` 核对完整性。首次试用只安装到 **web**，先结束当前任务并停止 web 服务。源码开发和候选生成见 [开发说明](docs/DEVELOPMENT.md)；用实际包路径替换下例：
+需要 Node.js 22.19 或更新的 22.x，或 24 及以上版本，与锁定宿主的范围一致；还需已安装的 DSH CLI。从 [Releases](https://github.com/ghang/dsh-cache-helper/releases) 下载对应版本的 `dsh-cache-helper.tgz` 和 `SHA256SUMS`，在两者所在目录执行 `shasum -a 256 -c SHA256SUMS` 核对完整性。首次试用只安装到 **web**，先结束当前任务并停止 web 服务。源码开发和候选生成见 [开发说明](docs/DEVELOPMENT.md)；用实际包路径替换下例：
 
 ```bash
 dsh plugin --profile web add /absolute/path/dsh-cache-helper.tgz --offline
@@ -88,7 +88,7 @@ dsh --profile web --port 3099
 | `maxEvents` | 200000 | 单会话分析事件数上限；超限且存在历史基线时等待未知检查确认 |
 | `maxCachedSessions` | 64 | 内存中保留派生指标的会话数，最大 200 |
 
-看板按 Asia/Shanghai 的调用发生日期筛选；默认最近 7 个自然日，可切 30 天或全部。辅助调用归属所在会话，继承记录供上下文比较但不重复计入全局用量；失败/取消摘要的已知开销由操作回执补充并与 Session 去重。缺时间、缺缓存字段、归属未知、未记录辅助调用与读取失败分别展示，达到扫描上限不表示所有历史会话都已分析。会话列表保留完整历史累计，步骤表按所选时间和模型筛选。
+看板按 Asia/Shanghai 的已记录调用时间筛选：摘要有明确 stream 开始回执时优先用开始时间，其他历史使用结算回执时间，缺少时间保持未知；默认最近 7 个自然日，可切 30 天或全部。辅助调用归属所在会话，继承记录供上下文比较但不重复计入全局用量；失败/取消摘要的已知开销由操作回执补充并与 Session 去重。缺时间、缺缓存字段、归属未知、未记录辅助调用与读取失败分别展示，达到扫描上限不表示所有历史会话都已分析。会话列表保留完整历史累计，步骤表按所选时间和模型筛选。
 
 ## 确认与数据保存
 

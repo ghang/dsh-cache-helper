@@ -19,7 +19,7 @@ const detail = (id, role = 'main') => ({ sessionId: id, title: id === 'child' ? 
   latest: receipt, cumulative: receipt, config: defaults, warnings: id === 'child' ? [warning] : [], pending: null,
   calls: [{ seq: id === 'child' ? 42 : 20, turn: 2, step: 3, at: NOW, usage: receipt }], turns: [] });
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const localRequire = createRequire(new URL('../package.json', import.meta.url));
   const browserRequire = process.env.DSH_BROWSER_TEST_MODULES
     ? createRequire(join(resolve(process.env.DSH_BROWSER_TEST_MODULES), '__dsh_next_test__.cjs')) : localRequire;
@@ -35,7 +35,7 @@ async function fixture(t) {
     readFile(new URL('./fixtures/host-theme.css', import.meta.url), 'utf8'),
   ]);
   const requests = [];
-  const sessions = { main: detail('main'), child: detail('child', 'sub') };
+  const sessions = options.sessions ?? { main: detail('main'), child: detail('child', 'sub') };
   const preview = { id: 'operation-one', sessionId: 'main', state: 'prepared', available: true,
     route: { provider: 'synthetic-provider', model: 'synthetic-model' },
     input: { acceptedInHistory: true }, context: { beforeTokens: 100000, afterTokens: null }, summaryCalls: [] };
@@ -51,13 +51,14 @@ async function fixture(t) {
         sessions: Object.values(sessions).map(item => ({ ...item, warningCount: item.sessionId === 'main' ? 2 : 1 })),
         generatedAt: NOW, policyVersion: 3, coverage: { scanned: 2, total: 20, limit: 2, limited: true, errors: [] },
         statistics: { totals: { knownCacheReadTokens: state.statisticsReadTokens, knownHitRate: 0.9, estimatedLossTokens: 900,
-          warnings: 1, recoveredWarnings: 0, expectedRebuilds: 1, cacheUnknownCalls: 1, coldStarts: 1, emptyAttempts: 2 },
+          warnings: 1, recoveredWarnings: 0, expectedRebuilds: 1, cacheUnknownCalls: 1, coldStarts: 1, emptyAttempts: 2,
+          unrecordedAuxiliaryOperations: 1 },
           groups: { main: group(1), sub: group(1), auxiliary: group(1, { cacheUnknownCalls: 1 }), unknown: group(0) },
           byDate: [{ date: '2026-10-22', calls: 3, warnings: 1 }],
           byModel: [{ provider: 'synthetic-provider', model: 'model-a', calls: 3 }],
           availableModels: [{ provider: 'synthetic-provider', model: 'model-a' }],
           recommendations: [{ id: 'tools', title: '检查工具声明变化', message: '合成建议依赖实际异常步骤。',
-            evidence: [{ sessionId: 'child', seq: 42, turn: 2, step: 3 }] }],
+            evidence: [options.evidence ?? { sessionId: 'child', seq: 42, turn: 2, step: 3 }] }],
           coverage: { ownershipUnknownCalls: 1, unknownDateCalls: 1, auxiliaryRecordingComplete: false } },
       });
       if (url.pathname.endsWith('/session')) return json(response, sessions[url.searchParams.get('sessionId')] ?? detail('main'));
@@ -175,9 +176,41 @@ test('browser next: statistics filters, unknown coverage and exact evidence rema
   const texts = await page.getByRole('region', { name: '缓存专项统计' }).innerText();
   assert.match(texts, /主会话/); assert.match(texts, /子会话/); assert.match(texts, /角色未知/);
   assert.match(texts, /1 次缓存用量未知/); assert.match(texts, /发送状态未知/); assert.match(texts, /未记录不代表零开销/);
+  assert.match(texts, /未记录辅助操作 1 次/);
   assert.ok(requests.some(item => item.search.period === '30d' && item.search.model === 'model-a'));
   await page.setViewportSize({ width: 360, height: 900 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), true);
+  assert.deepEqual(errors, []);
+});
+
+test('browser next: retry warnings match the exact settlement while legacy records retain their step fallback', async t => {
+  const retry = detail('child', 'sub');
+  retry.calls = [
+    { seq: 41, turn: 2, step: 3, at: NOW, settlement: 'assistant/attempt', usage: receipt },
+    { seq: 42, turn: 2, step: 3, at: NOW, settlement: 'assistant/message', usage: receipt },
+    { turn: 4, step: 1, at: NOW, settlement: 'assistant/message', usage: receipt },
+  ];
+  retry.warnings = [
+    { ...warning, seq: 41 },
+    { ...warning, id: 'legacy-warning', seq: undefined, turn: 4, step: 1 },
+  ];
+  const { page, errors } = await fixture(t, { sessions: { main: detail('main'), child: retry },
+    evidence: { sessionId: 'child', seq: 41, turn: 2, step: 3 } });
+  await page.getByRole('button', { name: '查看证据 · 第 2 轮 · 步骤 3', exact: true }).click();
+  const panel = page.getByRole('region', { name: '调用步骤明细', exact: true });
+  await panel.locator('.dch-call-evidence[data-cache-evidence-seq="41"]').waitFor();
+  assert.equal(await panel.locator('.dch-call-evidence').count(), 1);
+  assert.equal(await panel.locator('[data-cache-evidence-seq="42"]').count(), 0,
+    'Only-warning mode must not include a later success that reused the failed attempt\'s turn and step');
+  const legacyRow = panel.getByRole('row').filter({ hasText: '第 4 轮 · 步骤 1' });
+  assert.equal(await legacyRow.count(), 1, 'A legacy record without a reliable sequence still matches its warning');
+  assert.match(await legacyRow.getAttribute('class'), /dch-call-warning/);
+  await page.getByRole('checkbox', { name: '只看异常', exact: true }).uncheck();
+  const recovered = panel.locator('[data-cache-evidence-seq="42"]');
+  await recovered.waitFor();
+  assert.doesNotMatch(await recovered.getAttribute('class'), /dch-call-warning/,
+    'Conflicting event sequences must never fall back to a shared turn and step');
+  assert.equal(await recovered.getByText('无异常记录', { exact: true }).count(), 1);
   assert.deepEqual(errors, []);
 });
 
@@ -201,8 +234,15 @@ test('browser next: compaction is started once, survives closing, and waits for 
   const completedStatistics = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/dashboard'));
   state.statisticsReadTokens = 3600;
   state.job = { ...state.job, state: 'completed', context: { beforeTokens: 100000, afterTokens: 2000 },
-    summaryCalls: [{ provider: 'synthetic-provider', model: 'summary-model', usage: receipt, durationMs: 123 }] };
+    summaryCalls: [
+      { provider: 'synthetic-provider', model: 'summary-model', usage: receipt, durationMs: 123,
+        source: 'llm-stream', llmStreamCall: true },
+      { provider: 'synthetic-provider', model: 'template-model', source: 'session-summary', llmStreamCall: false,
+        usageRecorded: false, usage: { inputTokens: null, cacheReadTokens: null }, durationMs: null },
+    ] };
   await dialog.getByText('分支与摘要已生成', { exact: true }).waitFor();
+  await dialog.getByText(/^摘要记录（模型调用未确认）：synthetic-provider \/ template-model/).waitFor();
+  assert.equal(await dialog.getByText(/^摘要调用：synthetic-provider \/ summary-model/).count(), 1);
   await completedStatistics;
   await page.getByRole('region', { name: '缓存专项统计' }).getByText('3,600 tok', { exact: true }).waitFor();
   await page.getByRole('button', { name: '查看分支压缩方案', exact: true }).waitFor();

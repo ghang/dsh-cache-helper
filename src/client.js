@@ -46,6 +46,10 @@ window.__ModuleLoader__.load({
     const number = new Intl.NumberFormat('zh-CN');
 
     const finite = value => typeof value === 'number' && Number.isFinite(value);
+    const reliableSeq = value => Number.isSafeInteger(value) && value >= 0;
+    const confirmedSummaryCall = call => call.source !== 'session-summary'
+      || call.llmStreamCall === true || call.usageRecorded === true
+      || ['inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens'].some(field => finite(call.usage?.[field]) && call.usage[field] >= 0);
     const exact = value => finite(value) ? number.format(Math.round(value)) : '未知';
     const short = value => !finite(value) ? '未知' : value >= 1000000
       ? `${(value / 1000000).toFixed(2).replace(/\.00$/, '')}m`
@@ -455,7 +459,7 @@ window.__ModuleLoader__.load({
             const group = statistics.groups?.[role] || {};
             return h('tr', { key: role }, h('th', { scope: 'row' }, label), h('td', null, exact(group.calls || 0)), h('td', null, `${short(group.knownCacheReadTokens || 0)} tok`), h('td', null, exact(group.cacheUnknownCalls || 0)), h('td', null, exact(group.failedAttempts || 0)));
           })))),
-        h('p', { className: 'dch-note' }, `冷启动 ${exact(total.coldStarts || 0)} 次 · 空尝试 ${exact(total.emptyAttempts || 0)} 次（发送状态未知） · 归属未知 ${exact(coverage.ownershipUnknownCalls || 0)} 次 · 缺少时间 ${exact(coverage.unknownDateCalls || 0)} 次。辅助调用只覆盖已记录数据，未记录不代表零开销。`),
+        h('p', { className: 'dch-note' }, `冷启动 ${exact(total.coldStarts || 0)} 次 · 空尝试 ${exact(total.emptyAttempts || 0)} 次（发送状态未知） · 未记录辅助操作 ${exact(total.unrecordedAuxiliaryOperations || 0)} 次 · 归属未知 ${exact(coverage.ownershipUnknownCalls || 0)} 次 · 缺少时间 ${exact(coverage.unknownDateCalls || 0)} 次。辅助调用只覆盖已记录数据，未记录不代表零开销。`),
         h('details', null, h('summary', null, '日期与模型分布'),
           h('div', { className: 'dch-distributions' }, h('ul', null, ...(statistics.byDate || []).map(row => h('li', { key: row.date }, `${row.date}：${exact(row.calls)} 次调用，${exact(row.warnings)} 次异常`))),
             h('ul', null, ...(statistics.byModel || []).map(row => h('li', { key: `${row.provider}:${row.model}` }, `${row.provider || '未知提供方'} / ${row.model || '未知模型'}：${exact(row.calls)} 次调用`))))),
@@ -527,7 +531,12 @@ window.__ModuleLoader__.load({
         known += 1;
         read += usage.cacheReadTokens; miss += usage.inputTokens; total += prompt;
       }
-      const warningFor = call => (detail?.warnings || []).find(warning => warning.seq === call.seq && finite(call.seq) || warning.turn === call.turn && warning.step === call.step);
+      const warningFor = call => {
+        const warnings = detail?.warnings || [];
+        return (reliableSeq(call.seq) ? warnings.find(warning => warning.seq === call.seq) : undefined)
+          || warnings.find(warning => (!reliableSeq(call.seq) || !reliableSeq(warning.seq))
+            && finite(call.turn) && finite(call.step) && warning.turn === call.turn && warning.step === call.step);
+      };
       const calls = Array.isArray(detail?.calls) ? detail.calls : [];
       const filters = data?.statistics?.filters;
       const filteredCalls = calls.filter(call => (!onlyWarnings || Boolean(warningFor(call)))
@@ -544,7 +553,7 @@ window.__ModuleLoader__.load({
       const errorCount = Array.isArray(coverageErrors) ? coverageErrors.length : finite(coverageErrors) ? coverageErrors : 0;
       const content = h('div', { className: 'dch-modal-body' },
           h('div', { className: 'dch-row-between dch-dashboard-toolbar' },
-            h('p', { className: 'dch-note' }, '范围：已扫描主会话、子会话与已记录辅助调用。日期按调用发生时间，冷启动与预期重建分别统计。'),
+            h('p', { className: 'dch-note' }, '范围：已扫描主会话、子会话与已记录辅助调用。日期优先采用已记录摘要调用的开始时间，其他历史按回执结算时间；冷启动与预期重建分别统计。'),
             h('label', { className: 'dch-check' }, h('input', { type: 'checkbox', checked: onlyWarnings, onChange: event => { setOnlyWarningsFilter(event.target.checked); } }), '只看异常'),
             h(Button, { onClick: () => { void load(); }, disabled: loading }, loading ? '读取中…' : '刷新')),
           error ? h('p', { className: 'dch-error', role: 'alert' }, error) : null,
@@ -681,7 +690,7 @@ window.__ModuleLoader__.load({
             job.input ? h('p', { className: 'dch-note' }, `历史中已接纳输入：${job.input.acceptedInHistory ? '保留一份' : '无'}；输入框草稿不自动复制。`) : null,
             job.branchId ? h('p', { className: 'dch-session-id' }, `${job.branchCreated === false ? '预留分支 ID（创建尚未确认，请手动核对）' : '分支 ID'}：${job.branchId}`) : null,
             job.context ? h('p', { className: 'dch-note' }, `上下文估计：${short(job.context.beforeTokens)} → ${short(job.context.afterTokens)} tok。缓存恢复等待后续真实回执，不代表已节省费用。`) : null,
-            ...(job.summaryCalls || []).map((call, index) => h('p', { className: 'dch-note', key: index }, `摘要调用：${call.provider || '未知'} / ${call.model || '未知'} · 未缓存 ${short(call.usage?.inputTokens)} tok · 缓存读取 ${short(call.usage?.cacheReadTokens)} tok · 耗时 ${finite(call.durationMs) ? `${exact(call.durationMs)} ms` : '未知'}`)),
+            ...(job.summaryCalls || []).map((call, index) => h('p', { className: 'dch-note', key: index }, `${confirmedSummaryCall(call) ? '摘要调用' : '摘要记录（模型调用未确认）'}：${call.provider || '未知'} / ${call.model || '未知'} · 未缓存 ${short(call.usage?.inputTokens)} tok · 缓存读取 ${short(call.usage?.cacheReadTokens)} tok · 耗时 ${finite(call.durationMs) ? `${exact(call.durationMs)} ms` : '未知'}`)),
             job.error ? h('p', { className: 'dch-error', role: 'status' }, job.error.message) : null),
           error && job ? h('p', { className: 'dch-error', role: 'alert' }, error) : null),
         h('footer', { className: 'dch-modal-footer' },

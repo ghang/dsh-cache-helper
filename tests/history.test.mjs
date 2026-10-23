@@ -104,6 +104,8 @@ test('auxiliary accounting uses recorded summary usage and keeps lifecycle durat
   assert.equal(result.auxiliaryCalls.length, 1);
   assert.equal(result.auxiliaryCalls[0].usage.cacheReadTokens, 90);
   assert.equal(result.auxiliaryCalls[0].model, 'summary-model');
+  assert.equal(result.auxiliaryCalls[0].at, 150);
+  assert.equal(result.auxiliaryCalls[0].atSource, 'session-summary-settlement');
   assert.equal(result.auxiliaryCalls[0].operationElapsedMs, 100);
   assert.equal(result.auxiliaryCalls[0].modelDurationMs, null);
   assert.equal(result.auxiliaryCalls[0].durationSource, 'compaction-lifecycle');

@@ -4,7 +4,7 @@
 
 ## 环境与目录
 
-使用 Node.js 22 或更新版本，使用项目的 `package-lock.json` 固定开发依赖。运行时依赖由 DSH 提供，发布包不嵌入完整宿主或另一份 React。
+使用 Node.js 22.19 或更新的 22.x，或 24 及以上版本，使用项目的 `package-lock.json` 固定开发依赖。运行时依赖由 DSH 提供，发布包不嵌入完整宿主或另一份 React。
 
 | 目录或文件 | 用途 |
 |---|---|
@@ -43,7 +43,7 @@ npm run check:release
 
 这些脚本针对 cache-helper 的包名、入口、宿主兼容范围和测试集编写。其他插件可复用检查顺序和证据要求，但不能直接改包名后宣称通过同一套门禁。
 
-当前 CI 使用 Node 24，安装锁定依赖和 Chromium 后运行 `check:release`。它不执行真实仓库提交身份门禁、创建 Release、发布 npm 或提交插件榜。完整发布的入口与现有自动化边界见[发行流程](RELEASING.md)；统一发行命令尚未实现。
+CI 定义在 Node 22.19.0 与 24.18.1 两个环境检查完整公开提交身份，安装锁定依赖和 Chromium 后运行 `check:release`，并留存候选报告与校验值。PR 使用实际 head commit，避免将 GitHub 合成 merge 的署名当成插件提交身份；完整历史和 tag 仍受检查。远端是否实际执行与通过需另核验；CI 不创建 Release、发布 npm 或提交插件榜。完整发布的入口与现有自动化边界见[发行流程](RELEASING.md)；统一发行命令尚未实现。
 
 ## 验证范围
 
@@ -104,6 +104,8 @@ web 接口使用 DSH 现有浏览器认证，模型或 API operator 不能代替
 | `POST /dsh-cache-helper/api/operations/start` | `{sessionId, id}`；同候选幂等，明确开始分支压缩 |
 | `POST /dsh-cache-helper/api/operations/cancel` | `{sessionId, id}`；取消后保留已经创建的分支 |
 | `POST /dsh-cache-helper/api/warnings/dismiss` | `{sessionId, id, dismissed}`；只改变指定会话中已存在告警的收起状态 |
+
+dashboard 日期按记录时间：摘要存在明确 stream 开始回执时先按分支与 summary seq 合并，再进行日期筛选和去重；其他历史保留结算回执时间，来源与未知单列。相同调用不会因分支是否进入扫描而改变日期。
 
 服务端状态文件只保存版本与告警收起 ID。浏览器的异常筛选只保存布尔值；受控操作单独保存脱敏恢复元数据与实际摘要回执，不保存正文或凭据。配置值通过宿主 ConfigForms/ConfigEditor 保存，插件不另建配置文档。
 

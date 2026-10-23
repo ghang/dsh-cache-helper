@@ -7,16 +7,39 @@ permissions:
   contents: read
 jobs:
   check:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.19.0', '24.18.1']
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Audit actual proposed commits instead of GitHub's synthetic PR merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node }}
           cache: npm
           registry-url: https://registry.npmjs.org
+      - name: Check public commit identities
+        env:
+          PUBLIC_GIT_EMAIL: 12455956+ghang@users.noreply.github.com
+        run: |
+          git config --local user.name ghang
+          git config --local user.email "$PUBLIC_GIT_EMAIL"
+          git config --local user.useConfigOnly true
+          npm run check:identity -- --all
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npx --no-install playwright install --with-deps chromium
       - run: npm run check:release
+      - name: Retain candidate reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-reports-node-${{ matrix.node }}
+          path: |
+            .release/release-report.json
+            .release/SHA256SUMS
+          if-no-files-found: warn

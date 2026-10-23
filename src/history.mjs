@@ -128,7 +128,8 @@ export function sessionAccounting(records) {
     const start = starts.get(data.compactionId);
     const end = ends.get(data.compactionId);
     summaries.add(data.compactionId);
-    const position = { seq: event.seq, at: event.time, inherited: inherited(event.seq),
+    const position = { seq: event.seq, at: event.time, atSource: 'session-summary-settlement',
+      inherited: inherited(event.seq),
       compactionId: data.compactionId ?? null, purpose: 'compaction',
       provider: data.provider ?? null, model: data.model ?? null };
     // An unmarked template/remote summary is not proof of an LLM call. A

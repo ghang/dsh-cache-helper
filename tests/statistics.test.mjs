@@ -99,6 +99,71 @@ test('unknown dates are isolated in all-time statistics and excluded from bounde
   assert.equal(all.byDate[0].date, 'unknown');
 });
 
+test('a witnessed summary start is matched before Shanghai date filtering and stays consistent across scan coverage', () => {
+  const started = at('2026-10-22T15:59:59Z');
+  const settled = at('2026-10-22T16:00:01Z');
+  const now = at('2026-10-29T04:00:00Z');
+  const summary = call(8, { at: settled, atSource: 'session-summary-settlement',
+    settlement: 'compaction/summary', outcome: 'completed' });
+  const records = [session('source', []), session('branch', [], { auxiliaryCalls: [summary] })];
+  const operations = [{ id: 'midnight-job', sessionId: 'source', branchId: 'branch', state: 'completed', summaryCalls: [
+    { summarySeq: 8, at: started, atSource: 'llm-stream-start', llmStreamCall: true, source: 'llm-stream',
+      settledAt: settled, settledAtSource: 'session-summary-settlement',
+      provider: 'provider', model: 'model', usageRecorded: true, usage: usage(), outcome: 'completed' },
+  ] }];
+  for (const [filter, expectedCalls] of [
+    [{ period: 'all' }, 1], [{ period: '7d' }, 0],
+    [{ period: 'all', model: 'model', provider: 'provider' }, 1],
+    [{ period: 'all', fromDate: '2026-10-23' }, 0],
+    [{ period: 'all', toDate: '2026-10-22' }, 1],
+    [{ period: 'all', model: 'other' }, 0],
+  ]) {
+    const both = aggregateStatistics(records, { now, operations, ...filter });
+    const sourceOnly = aggregateStatistics([records[0]], { now, operations, ...filter });
+    assert.equal(both.totals.calls, expectedCalls);
+    assert.equal(sourceOnly.totals.calls, expectedCalls);
+    assert.deepEqual(both.byDate, sourceOnly.byDate);
+    assert.deepEqual(both.groups.auxiliary, sourceOnly.groups.auxiliary);
+    if (expectedCalls) {
+      assert.equal(both.byDate[0].date, '2026-10-22');
+      assert.equal(both.coverage.callTimeSources.summaryStreamStart, 1);
+      assert.equal(sourceOnly.coverage.callTimeSources.summaryStreamStart, 1);
+    }
+  }
+  assert.equal(summary.at, settled, 'The authoritative Session settlement timestamp remains unchanged');
+  assert.equal(summary.atSource, 'session-summary-settlement');
+  assert.deepEqual(summary.usage, usage());
+});
+
+test('summary timing never joins another branch or sequence and legacy settlements keep their recorded date', () => {
+  const started = at('2026-10-22T15:59:59Z');
+  const settled = at('2026-10-22T16:00:01Z');
+  const now = at('2026-10-23T13:00:00Z');
+  const records = [session('source', []), session('branch', [], { auxiliaryCalls: [
+    call(8, { at: settled, settlement: 'compaction/summary', outcome: 'completed' }),
+  ] })];
+  const operation = { id: 'other-summary', sessionId: 'source', branchId: 'branch', state: 'completed', summaryCalls: [
+    { summarySeq: 8, at: started, atSource: 'llm-stream-start', llmStreamCall: true,
+      provider: 'provider', model: 'model', usage: usage(), outcome: 'completed' },
+  ] };
+  for (const candidate of [
+    { ...operation, branchId: 'other-branch' },
+    { ...operation, summaryCalls: [{ ...operation.summaryCalls[0], summarySeq: 9 }] },
+  ]) {
+    const result = aggregate(records, { period: 'all', now, operations: [candidate] });
+    assert.equal(result.totals.calls, 2, 'Different identities represent distinct calls');
+    assert.equal(result.byDate.find(row => row.date === '2026-10-23').calls, 1);
+    assert.equal(result.byDate.find(row => row.date === '2026-10-22').calls, 1);
+  }
+  const legacy = aggregate(records, { period: 'all', now, operations: [{ ...operation,
+    summaryCalls: [{ ...operation.summaryCalls[0], atSource: undefined }] }] });
+  assert.equal(legacy.totals.calls, 1);
+  assert.equal(legacy.byDate[0].date, '2026-10-23');
+  assert.equal(legacy.coverage.callTimeSources.receiptSettlement, 1);
+  assert.equal(legacy.coverage.callTimeSources.summaryStreamStart, 0);
+  assert.equal(legacy.coverage.callTimeBasis, 'recorded-summary-stream-start-else-receipt-settlement');
+});
+
 test('model and date ranges also select failed and auxiliary recorded calls', () => {
   const result = aggregate([session('one', [call(1), call(2, { model: 'other' }),
     call(3, { settlement: 'assistant/attempt' })], { auxiliaryCalls: [call(4, { settlement: 'compaction/summary' })] })],
@@ -219,6 +284,48 @@ test('operation-scoped compaction receipts resolve Session gaps only for the exa
   assert.equal(unknown.totals.cacheUnknownCalls, 1, 'A recorded call without usage is still unknown');
   assert.equal(unknown.totals.missingUsageCalls, 1);
   assert.equal(unknown.totals.unrecordedAuxiliaryOperations, 0, 'Unknown usage and missing call records are separate gaps');
+});
+
+test('unmarked summary metadata remains a coverage gap without manufacturing a model call', () => {
+  const fallback = { id: 'template-job', sessionId: 'source', branchId: 'branch', state: 'completed', summaryCalls: [
+    { source: 'session-summary', llmStreamCall: false, usageRecorded: false, summarySeq: 8,
+      compactionId: 'template-compaction', provider: 'provider', model: 'model', at: NOW,
+      usage: { inputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, outputTokens: null },
+      outcome: 'completed' },
+  ] };
+  const branch = session('branch', [], { auxiliaryCoverage: { unrecorded: [
+    { seq: 8, compactionId: 'template-compaction', at: NOW, provider: 'provider', model: 'model',
+      inherited: false, purpose: 'compaction', reason: 'summary-without-call-receipt' },
+  ] } });
+  for (const records of [[session('source', []), branch], [session('source', [])]]) {
+    const result = aggregate(records, { operations: [fallback] });
+    assert.equal(result.groups.auxiliary.calls, 0);
+    assert.equal(result.totals.cacheUnknownCalls, 0, 'No call was established; its unrecorded operation is separate');
+    assert.equal(result.totals.unrecordedAuxiliaryOperations, 1, 'The same Session and operation gap must appear once');
+    assert.equal(result.coverage.operationSummaryRecordsUnconfirmed, 1);
+    assert.ok(result.recommendations.some(item => item.id === 'coverage'));
+  }
+  const legacy = structuredClone(fallback); delete legacy.summaryCalls[0].llmStreamCall;
+  assert.equal(aggregate([branch], { operations: [legacy] }).totals.calls, 0,
+    'Older Session fallback metadata without stream evidence must not manufacture a call either');
+});
+
+test('a witnessed summary stream without usage is an unknown call and reported usage also proves a fallback call', () => {
+  const result = aggregate([session('source', [])], { operations: [
+    { id: 'stream-job', sessionId: 'source', branchId: 'branch', state: 'completed', summaryCalls: [
+      { source: 'session-summary', llmStreamCall: true, usageRecorded: false, summarySeq: 8,
+        compactionId: 'stream', provider: 'provider', model: 'model', at: NOW, outcome: 'completed' },
+      { source: 'session-summary', llmStreamCall: false, usageRecorded: true, summarySeq: 9,
+        compactionId: 'reported', provider: 'provider', model: 'model', at: NOW, outcome: 'completed', usage: usage() },
+    ] },
+  ] });
+  assert.equal(result.groups.auxiliary.calls, 2);
+  assert.equal(result.groups.auxiliary.successfulCalls, 2);
+  assert.equal(result.totals.cacheUnknownCalls, 1);
+  assert.equal(result.totals.missingUsageCalls, 1);
+  assert.equal(result.totals.cacheReadTokens, null);
+  assert.equal(result.totals.knownCacheReadTokens, 90);
+  assert.equal(result.totals.unrecordedAuxiliaryOperations, 0);
 });
 
 test('invalid date/model/range inputs fail explicitly', () => {
