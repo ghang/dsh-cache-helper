@@ -1,6 +1,6 @@
 {
   "name": "dsh-cache-helper",
-  "version": "0.2.0-rc.2",
+  "version": "0.2.0-rc.3",
   "description": "DSH 缓存命中统计、发送前缓存风险确认与会话缓存看板",
   "type": "module",
   "main": "lib/index.mjs",

@@ -136,7 +136,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
           turn===18&&!options.lateFooter?null:h('div',{'data-clock':'end',className:'actions',key:options.footerVersion||0},
             h('button',{className:'action','aria-label':'复制第'+turn+'轮'},h(FixtureIcon,{kind:'copy'})),h('button',{className:'action','aria-label':'分支第'+turn+'轮'},h(FixtureIcon,{kind:'branch'})),
             h('span',{className:'endInfo'},
-              options.compact?null:h('span',{className:'root','data-native-usage':turn},h('button',{className:'trigger','aria-haspopup':'dialog',onClick:()=>setOpen(!open),'aria-label':'第'+turn+'轮用量'},h(FixtureIcon,{kind:'usage'}),h('span',{className:'label'},'用量 '+turn+'k tok'))),
+              options.compact?null:h('span',{className:'root','data-native-usage':turn},h('button',{className:'trigger','aria-haspopup':'dialog',onClick:()=>setOpen(!open),'aria-label':'第'+turn+'轮用量'},h(FixtureIcon,{kind:'usage'}),h('span',{className:'label'},'用量 '+turn+'K tok'))),
               options.noClock?null:h('span',{className:'timeEnd','data-native-clock':turn},'10:'+String(turn).padStart(2,'0')),
               options.changedFooter?h('a',{href:'#unknown'},'宿主结构已变化'):null)),
           open?ReactDOM.createPortal(h('div',{role:'dialog','aria-label':'原生第'+turn+'轮用量详情',className:'native-usage-dialog'},h('p',null,'原生用量详情'),h('button',{onClick:()=>setOpen(false)},'关闭原生用量详情')),document.body):null);
@@ -149,7 +149,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
         h('div',{className:'fixture-composer-stack'+(options.embedded?' fixture-composer-stack-embedded':''),style:{'--dsh-conversation-column-width':'1440px'}},
           options.helper===false?null:h(__registrations[1].component,{sessionId:id}),
           h('div',{className:'fixture-input-root'},h('div',{id:'fixture-input-card',className:'fixture-input-card'},'模拟输入框'),
-            h('div',{'data-composer-dock':true,className:'fixture-input-dock'},h('span',{id:'native-usage'},'用量 100k tok'),options.helper===false?null:h(__registrations[0].component,{sessionId:id})))));
+            h('div',{'data-composer-dock':true,className:'fixture-input-dock'},h('span',{id:'native-usage'},'用量 100K tok'),options.helper===false?null:h(__registrations[0].component,{sessionId:id})))));
       }
       function SettingsFixture(){
         const [open,setOpen]=React.useState(true);
@@ -195,6 +195,11 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     }
     assert.equal(await locator.isChecked(), value, message);
   };
+  const showSessionTab = async dashboard => {
+    const tab = dashboard.getByRole('tab', { name: '会话明细', exact: true });
+    await tab.click();
+    assert.equal(await tab.getAttribute('aria-selected'), 'true');
+  };
   const capture = async outputPath => {
     if (!outputPath) return;
     const requested = process.env.DSH_CLIENT_TEST_SCREENSHOT_VIEWPORT;
@@ -214,7 +219,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
   try {
     const fixtureUrl = `http://127.0.0.1:${server.address().port}`;
     await page.goto(fixtureUrl);
-    await page.getByText('末次缓存 99k tok · 99%', { exact: true }).waitFor();
+    await page.getByText('末次缓存 99K tok · 99%', { exact: true }).waitFor();
     assert.deepEqual(await page.evaluate(() => __registrations.map(item => ({ name: item.meta.name, order: item.meta.order }))), [
       { name: 'conversation.composer.dock', order: 1.5 }, { name: 'conversation.input.dock', order: 10 }, { name: 'conversation.chat.turnTail', order: 100 }, { name: 'settings.section', order: 200 },
     ]);
@@ -229,9 +234,9 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
       assert.equal(await page.locator('[data-composer-dock] [data-dsh-cache-helper="warnings"]').count(), 0, `${label}: WARN is outside composer statistics dock`);
     };
     await assertComposerAlignment('main wide');
-    assert.equal(await tail(14).locator('[data-dsh-cache-helper="turn-reading"]').textContent(), '末次缓存 99k tok · 99%');
+    assert.equal(await tail(14).locator('[data-dsh-cache-helper="turn-reading"]').textContent(), '末次缓存 99K tok · 99%');
     assert.equal(await tail(15).locator('[data-dsh-cache-helper="turn-reading"]').textContent(), '末次缓存 2,048 tok · 0.39%');
-    assert.equal(await tail(16).locator('[data-dsh-cache-helper="turn-reading"]').textContent(), '末次缓存 636.4k tok · 99.69%');
+    assert.equal(await tail(16).locator('[data-dsh-cache-helper="turn-reading"]').textContent(), '末次缓存 636.4K tok · 99.69%');
     assert.equal(await tail(16).locator('.dch-turn-cache-anchor').getAttribute('data-cache-turn'), '16');
     assert.equal(await tail(16).locator('.dch-turn-cache-anchor').getAttribute('data-cache-turn-type'), 'number');
     assert.equal(await tail(16).locator('.dch-turn-cache-anchor').getAttribute('data-cache-raw-owner-type'), 'object', 'fixture passes the real TurnLocation owner shape');
@@ -255,8 +260,8 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await page.getByRole('button', { name: '关闭原生用量详情' }).click();
     assert.equal(await page.evaluate(() => __nativeUsage===document.querySelector('[data-native-usage="16"]')&&__nativeClock===document.querySelector('[data-native-clock="16"]')), true, 'native nodes remain owned and seated by host');
     await page.evaluate(() => __render('alpha', { lateFooter: true, footerVersion: 1 }));
-    await tail(18).getByText('末次缓存 88k tok · 88%', { exact: true }).waitFor();
-    await tail(16).getByText('末次缓存 636.4k tok · 99.69%', { exact: true }).waitFor();
+    await tail(18).getByText('末次缓存 88K tok · 88%', { exact: true }).waitFor();
+    await tail(16).getByText('末次缓存 636.4K tok · 99.69%', { exact: true }).waitFor();
     assert.equal(await tail(16).locator('[data-dsh-cache-helper-portal]').count(), 1, 'native footer recreation does not duplicate portal');
     await page.evaluate(() => {
       window.__nativeUsage=document.querySelector('[data-native-usage="16"]');
@@ -266,10 +271,10 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await page.waitForFunction(() => document.querySelector('[data-dsh-cache-helper-portal]') === null);
     assert.equal(await page.evaluate(() => __nativeUsage===document.querySelector('[data-native-usage="16"]')&&__nativeClock===document.querySelector('[data-native-clock="16"]')), true, 'helper removal preserves native usage and clock nodes');
     await page.evaluate(() => __render('alpha', { lateFooter: true, footerVersion: 1 }));
-    await tail(16).getByText('末次缓存 636.4k tok · 99.69%', { exact: true }).waitFor();
+    await tail(16).getByText('末次缓存 636.4K tok · 99.69%', { exact: true }).waitFor();
     await page.evaluate(() => __render('alpha', { primitiveOwner: true, lateFooter: true, footerVersion: 1 }));
     await tail(16).locator('.dch-turn-cache-anchor[data-cache-raw-owner-type="number"]').waitFor({ state: 'attached' });
-    assert.equal(await tail(16).locator('[data-dsh-cache-helper="turn-reading"]').textContent(), '末次缓存 636.4k tok · 99.69%', 'legacy primitive owners remain compatible');
+    assert.equal(await tail(16).locator('[data-dsh-cache-helper="turn-reading"]').textContent(), '末次缓存 636.4K tok · 99.69%', 'legacy primitive owners remain compatible');
     await page.evaluate(() => __render('alpha', { lateFooter: true, footerVersion: 1 }));
     assert.equal(await tail(16).locator('[data-dsh-cache-helper-portal]').count(), 1, 'StrictMode remount has one portal per turn');
     assert.equal(await tail(16).evaluate(element => getComputedStyle(element.querySelector('[data-dsh-cache-helper="turn-reading"]')).fontSize === getComputedStyle(element.querySelector('[data-native-clock]')).fontSize), true, 'cache reading inherits the native metadata text size');
@@ -277,7 +282,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await page.waitForFunction(() => __detachedObservations.some(item => item.turn===16));
     assert.equal(await page.evaluate(() => __detachedObservations.some(item => item.turn===16&&!item.connected&&item.tail===null&&item.phase==='waiting-tail')), true, 'fixture actually commits helper passive effects before slot container attachment');
     await tail(16).locator('.dch-turn-cache-anchor[data-cache-phase="attached"]').waitFor({ state: 'attached' });
-    await tail(16).getByText('末次缓存 636.4k tok · 99.69%', { exact: true }).waitFor();
+    await tail(16).getByText('末次缓存 636.4K tok · 99.69%', { exact: true }).waitFor();
     assert.equal(await tail(16).locator('.dch-turn-cache-anchor').getAttribute('data-cache-observer'), 'tail');
     assert.equal(await page.evaluate(() => [...__activeObservers.values()].filter(target => target===document.documentElement).length), 0, 'attachment observers stop immediately after tails are found');
     assert.equal(await tail(16).locator('[data-dsh-cache-helper-portal]').count(), 1, 'detached StrictMode attachment has no duplicate portal');
@@ -288,7 +293,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     assert.equal(await tail(16).locator('.dch-turn-cache-anchor').getAttribute('data-cache-observer'), 'none');
     assert.equal(await tail(16).locator('[data-dsh-cache-helper-portal]').count(), 0, 'missing owner cannot borrow turn or session data');
     await page.evaluate(() => __render('alpha', { lateFooter: true, footerVersion: 1 }));
-    await tail(16).getByText('末次缓存 636.4k tok · 99.69%', { exact: true }).waitFor();
+    await tail(16).getByText('末次缓存 636.4K tok · 99.69%', { exact: true }).waitFor();
     await page.evaluate(() => __render('alpha', { compact: true, lateFooter: true, footerVersion: 1 }));
     await page.waitForFunction(() => {
       const info = document.querySelector('[data-turn-tail="16"] .endInfo');
@@ -304,7 +309,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     assert.equal(await tail(16).locator('[data-native-usage]').count(), 1, 'unknown structure retains host usage and adds no fallback reading');
     assert.equal(await tail(16).locator('[data-native-clock]').count(), 1);
     await page.evaluate(() => __render('alpha', { lateFooter: true, footerVersion: 1 }));
-    await tail(16).getByText('末次缓存 636.4k tok · 99.69%', { exact: true }).waitFor();
+    await tail(16).getByText('末次缓存 636.4K tok · 99.69%', { exact: true }).waitFor();
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'narrow native answer footers do not overflow');
     for (const turnNumber of [14, 15, 16, 17, 18, 19]) {
@@ -372,6 +377,8 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
 
     await tail(16).getByRole('button', { name: '缓存看板', exact: true }).click();
     await page.getByRole('dialog', { name: '缓存有效率看板' }).waitFor();
+    assert.equal(await page.getByRole('tab', { name: '会话明细', exact: true }).getAttribute('aria-selected'), 'true',
+      'A turn shortcut opens directly to its session instead of the overview');
     await page.getByRole('cell', { name: '0.4%', exact: true }).first().waitFor();
     await page.getByRole('button', { name: /演示会话：缓存用量未知/ }).click();
     await page.getByRole('cell', { name: '未知', exact: true }).waitFor();
@@ -379,7 +386,8 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await page.getByLabel('只看异常').check();
     await page.getByText('1 个调用步骤', { exact: true }).waitFor();
     assert.equal(await page.locator('tbody tr').count(), 1);
-    assert.equal(await page.locator('.dch-dashboard-toolbar').getByLabel('只看异常').count(), 1, 'anomaly filter belongs to the global dashboard toolbar');
+    assert.equal(await page.getByRole('tabpanel', { name: '会话明细', exact: true }).getByLabel('只看异常').count(), 1,
+      'The shared anomaly filter is visible in the session page');
     await page.getByRole('button', { name: /演示会话：缓存用量未知/ }).click();
     await page.getByText('没有异常步骤', { exact: true }).waitFor();
     await assertChecked(page.getByLabel('只看异常'), true, 'changing selected session keeps the global anomaly filter');
@@ -405,7 +413,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await tail(14).getByText('末次缓存 4,321 tok · 43.21%', { exact: true }).waitFor();
     assert.equal(await page.getByRole('dialog', { name: '缓存有效率看板' }).count(), 0, 'switching session hides the old per-turn dashboard');
     await page.evaluate(() => __render('alpha'));
-    await tail(14).getByText('末次缓存 99k tok · 99%', { exact: true }).waitFor();
+    await tail(14).getByText('末次缓存 99K tok · 99%', { exact: true }).waitFor();
     assert.equal(await page.getByRole('dialog', { name: '缓存有效率看板' }).count(), 0, 'returning to a reused turn does not revive an old dashboard');
 
     await page.evaluate(() => __render('late'));
@@ -414,7 +422,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await tail(1).getByText('末次缓存 未知 tok · 未知', { exact: true }).waitFor();
     await tail(14).getByText('末次缓存 4,321 tok · 43.21%', { exact: true }).waitFor();
     await page.waitForTimeout(1900);
-    assert.equal(await page.getByText(/12\.35m/).count(), 0, 'late response cannot overwrite another session');
+    assert.equal(await page.getByText(/12\.35M/).count(), 0, 'late response cannot overwrite another session');
     assert.equal(await tail(14).locator('[data-dsh-cache-helper="turn-reading"]').textContent(), '末次缓存 4,321 tok · 43.21%', 'same numbered turn is scoped to the current session');
     assert.equal(await tail(14).locator('[data-dsh-cache-helper-portal]').count(), 1, 'session switches do not duplicate portal containers');
     assert.equal(await page.locator('[data-dsh-cache-helper="warnings"]').count(), 0, 'another session does not inherit warnings');
@@ -427,13 +435,17 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     assert.deepEqual(await nativeSettings.locator('nav button').allTextContents(), ['通用', '归档会话', '其他插件', '缓存看板'], 'settings section is after archived and existing third-party sections');
     await nativeSettings.getByRole('button', { name: '缓存看板', exact: true }).click();
     const inline = nativeSettings.locator('.dch-settings-dashboard');
+    await inline.getByRole('tab', { name: '概览', exact: true }).waitFor();
+    assert.equal(await inline.getByRole('tab', { name: '概览', exact: true }).getAttribute('aria-selected'), 'true',
+      'The root settings page starts with a compact overview');
+    assert.equal(await page.evaluate(() => document.activeElement.textContent), '缓存看板', 'opening an inline dashboard does not steal native settings focus');
+    await showSessionTab(inline);
     await inline.locator('.dch-detail-heading h3').getByText('演示会话：工具清单变更', { exact: true }).waitFor();
     await assertChecked(inline.getByLabel('只看异常'), true, 'settings shares the value selected in a turn popup');
     assert.equal(await page.locator('[data-turn-tail]').count(), 0, 'settings dashboard works without an active conversation');
     assert.equal(await page.getByRole('dialog').count(), 1, 'settings renders content inline without a second dialog');
     assert.equal(await page.locator('.dch-overlay').count(), 0, 'inline settings adds no body overlay');
     assert.equal(await page.evaluate(() => document.body.style.overflow), '', 'inline settings does not acquire an independent scroll lock');
-    assert.equal(await page.evaluate(() => document.activeElement.textContent), '缓存看板', 'inline dashboard does not steal native settings focus');
     await inline.getByRole('searchbox', { name: '搜索会话' }).fill('缓存用量未知');
     assert.equal(await inline.locator('.dch-session-list button').count(), 1);
     failDetailId = 'beta';
@@ -467,6 +479,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     assert.equal(await page.getByRole('dialog').count(), 1, 'inline error recovery does not create a dialog');
     failDashboard = false;
     await inline.getByRole('button', { name: '刷新', exact: true }).click();
+    await showSessionTab(inline);
     await inline.locator('.dch-detail-heading h3').getByText('演示会话：工具清单变更', { exact: true }).waitFor();
     await nativeSettings.getByRole('button', { name: '关闭原生设置', exact: true }).click();
     await nativeSettings.waitFor({ state: 'detached' });
@@ -474,6 +487,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     emptyDashboard = true;
     await page.evaluate(() => __renderSettings());
     await nativeSettings.getByRole('button', { name: '缓存看板', exact: true }).click();
+    await showSessionTab(inline);
     await inline.getByText('没有匹配的会话', { exact: true }).waitFor();
     await inline.getByText('选择一个会话查看步骤', { exact: true }).waitFor();
     assert.equal(await inline.locator('tbody tr').count(), 0, 'empty dashboard does not invent a session');
@@ -507,6 +521,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.evaluate(() => __renderSettings({ withConversation: true }));
     await nativeSettings.getByRole('button', { name: '缓存看板', exact: true }).click();
+    await showSessionTab(inline);
     await inline.getByText(`${sessions.alpha.calls.length} 个调用步骤`, { exact: true }).waitFor();
     await inline.getByRole('button', { name: '下一页', exact: true }).click();
     await inline.getByText('2 / 2', { exact: true }).waitFor();
