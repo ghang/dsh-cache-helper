@@ -2,7 +2,7 @@
 
 为 DeepSeek Harness（DSH）显示实际缓存命中量，在发送前确认大规模缓存风险，并保留异常记录与会话统计看板。
 
-**当前工作源码：0.2.0，已定稿，尚未公开发行。** 已记录的公开版本为 0.1.2（2026-10-22 核对），预构建安装包通过 [GitHub Releases](https://github.com/ghang/dsh-cache-helper/releases) 提供；npm 与插件榜收录分别记录。本版包含分页看板、即时图表提示、配置热更新、专项统计、精简副本与 Context 联动。已有宿主验证环境为 DSH `0.2.1-rc.2` 的 `web` profile；本版包验证与实际运行状态分别记录，其他版本仍需验证。
+**当前公开版本：0.2.0（2026-10-24）。** [GitHub Release](https://github.com/ghang/dsh-cache-helper/releases/tag/v0.2.0) 与 [npm](https://www.npmjs.com/package/dsh-cache-helper/v/0.2.0) 均已公开，两个渠道的安装包与冻结产物逐字节一致。本版包含分页看板、即时图表提示、配置热更新、专项统计、精简副本与 Context 联动。已验证宿主环境为 DSH `0.2.1-rc.2` 的 `web` profile；市场索引刷新、本机是否升级与公开发行分别核对，其他版本仍需验证。
 
 ## 功能
 
