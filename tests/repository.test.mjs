@@ -24,11 +24,9 @@ function warnedSession(id) {
 
 function context(sessions, persistence, projections = []) {
   const lookup = new Map(sessions.map(session => [session.id, session]));
-  let analyses = 0;
   return {
-    get analyses() { return analyses; },
     sessions: { get: id => lookup.get(id), list: () => [...lookup.values()],
-      get messageProjections() { analyses++; return projections; } },
+      messageProjections: projections },
     get: name => name === 'sessionPersistence' ? persistence : undefined,
     logger: { warn() {} },
   };
@@ -106,7 +104,7 @@ test('cache eviction respects recent reads so a dashboard scan does not evict a 
   await repo.session('a');
   await repo.session('c');
   await repo.session('a');
-  assert.equal(ctx.analyses, 3);
+  assert.equal(repo.analysis.diagnostics().computations, 3);
   await repo.dispose();
 });
 
@@ -199,7 +197,8 @@ test('a policy update invalidates settled metrics without changing authoritative
   assert.equal(after.policyVersion, 2);
   assert.deepEqual(after.latest, before.latest);
   assert.deepEqual(after.cumulative, before.cumulative);
-  assert.equal(ctx.analyses, 2);
+  assert.equal(repo.analysis.diagnostics().computations, 1, 'Policy changes reuse neutral facts');
+  assert.equal(repo.analysis.diagnostics().derivations, 2);
   await repo.dispose();
 });
 

@@ -1,6 +1,9 @@
 import {
-  iterateCalls, latestReceiptSeq, normalizeRequest, reconstructCall, splitRecords, sessionAccounting,
+  iterateCallSteps, iterateAccountingSteps, latestReceiptSeq, normalizeRequest, reconstructCall, splitRecords,
 } from './history.mjs';
+import { selectReceiptBaseline } from './session-identity.mjs';
+import { performance } from 'node:perf_hooks';
+import { setImmediate as yieldImmediate } from 'node:timers/promises';
 
 export const DEFAULT_CONFIG = Object.freeze({ minLostTokens: 50_000, minLossRatio: 0.2 });
 const setting = config => ({ ...DEFAULT_CONFIG, ...config });
@@ -113,82 +116,190 @@ export function inspectNextRequest(records, options, config = {}) {
   };
 }
 
-function cumulativeUsage(calls) {
-  const sum = field => calls.reduce((total, call) => total + (call.usage[field] ?? 0), 0);
-  const completeSum = field => calls.every(call => call.usage[field] !== null) ? sum(field) : null;
-  const cacheKnownCalls = calls.filter(call => call.usage.promptTokens !== null).length;
-  const read = sum('cacheReadTokens');
-  const knownRead = calls.filter(call => call.usage.promptTokens !== null)
-    .reduce((total, call) => total + call.usage.cacheReadTokens, 0);
-  const prompt = calls.reduce((total, call) => total + (call.usage.promptTokens ?? 0), 0);
-  return {
-    inputTokens: completeSum('inputTokens'), cacheReadTokens: completeSum('cacheReadTokens'),
-    cacheWriteTokens: completeSum('cacheWriteTokens'), outputTokens: completeSum('outputTokens'),
-    knownCacheReadTokens: read,
-    promptTokens: cacheKnownCalls === calls.length ? prompt : null,
-    hitRate: cacheKnownCalls === calls.length && prompt > 0 ? read / prompt : null,
-    knownHitRate: prompt > 0 ? knownRead / prompt : null,
-    calls: calls.length, cacheKnownCalls,
-    missingUsageCalls: calls.filter(call => !call.usage.reported).length,
-  };
+export const ANALYZER_VERSION = 'p0-facts-v1';
+export const FACTS_SCHEMA_VERSION = 1;
+
+// Retained diagnostics must not turn a projection exception into a prompt copy.
+function diagnostic(value) {
+  if (!value) return undefined;
+  const text = String(value);
+  const fixed = [
+    '缺少 request/header，无法重建实际模型输入', '历史输入重建失败', 'Session surface 重建失败',
+    '无法重建上次请求', '当前模型的适配器输入投影尚未覆盖', 'system 包含非文本输入',
+    'system 更新缺少前置 user/tool turn', '空 system 历史更新', '输入投影失败',
+  ];
+  if (fixed.includes(text)) return text;
+  const types = ['image', 'file', 'audio', 'video', 'document', 'resource'];
+  for (const type of types) {
+    if (text === `不支持可靠比较的输入内容：${type}（附件/文件需适配器投影）`)
+      return text;
+  }
+  return '历史输入重建或适配投影失败';
 }
 
-/** Public result contains metrics and limited cause metadata, never prompts. */
-export function analyzeSession(records, config = {}) {
-  const resolved = setting(config);
-  const accounting = sessionAccounting(records);
+function retainedChanges(changes) {
+  return changes.map(change => {
+    if (change.kind === 'unknown') return { ...change, message: diagnostic(change.message) };
+    if (change.kind !== 'tools') return { ...change };
+    const result = { ...change };
+    for (const key of ['added', 'removed', 'changed']) {
+      result[key] = (change[key] ?? []).slice(0, 128).map(name => String(name).slice(0, 256));
+      if ((change[key]?.length ?? 0) > 128) result[`${key}Omitted`] = change[key].length - 128;
+    }
+    return result;
+  });
+}
+
+/**
+ * The iterator owns temporary replay state only while it runs. Its return value
+ * retains usage, hashes and finite diagnostics; no request, prompt or stream is
+ * retained. Both execution modes consume this exact iterator.
+ */
+function* iterateFacts(records, config) {
+  const accounting = yield* iterateAccountingSteps(records, config);
   const sessionId = splitRecords(records).header?.id ?? config.sessionId;
   const inherited = seq => accounting.ownership.known ? seq < accounting.ownership.inheritedEventCount : null;
   const calls = [];
-  const warnings = [];
+  const receiptSeqs = [];
   let previous;
   let compactionIndex = 0;
   let lastCompactionSeq = -1;
-  for (const call of iterateCalls(records, config)) {
+  for (const checkpoint of iterateCallSteps(records, config)) {
+    if (!checkpoint?.call) { yield null; continue; }
+    const call = checkpoint.call;
     while (accounting.compactionSeqs[compactionIndex] < call.seq) {
       lastCompactionSeq = accounting.compactionSeqs[compactionIndex++];
+      yield null;
     }
+    config.onNormalize?.({ seq: call.seq });
     const currentInput = normalizeRequest(call.request, config.historicalCapabilities ?? {});
-    let difference;
-    let warning;
+    let comparison;
     if (previous) {
-      difference = compareRequests(previous.input, currentInput, {
-        ...resolved, previousPromptTokens: previous.call.usage.promptTokens,
+      const { significant, ...neutral } = compareRequests(previous.input, currentInput, {
+        previousPromptTokens: previous.call.usage.promptTokens,
       });
-      const oldPrompt = previous.call.usage.promptTokens;
-      const currentRead = call.usage.cacheReadTokens;
-      if (oldPrompt !== null && currentRead !== null && call.usage.reported) {
-        // Extra input can lower hit rate without losing old cached content.
-        // Compare actual read against the old prompt, not current total input.
-        const lossTokens = Math.max(0, oldPrompt - currentRead);
-        const lossRatio = oldPrompt > 0 ? lossTokens / oldPrompt : 0;
-        if (lossTokens >= resolved.minLostTokens && lossRatio >= resolved.minLossRatio) {
-          const observed = difference.changes.filter(change => change.kind !== 'unknown' && !change.preservesPrefix);
-          const unknown = !currentInput.comparable || !previous.input.comparable;
-          warning = {
-            id: `${sessionId ?? 'session'}:${call.seq}`,
-            turn: call.turn, step: call.step, seq: call.seq, at: call.at,
-            provider: call.provider, model: call.model, inherited: inherited(call.seq),
-            category: lastCompactionSeq > previous.call.seq
-              ? 'expected-rebuild' : 'unexpected-loss',
-            usage: call.usage,
-            inputTokens: call.usage.inputTokens, missTokens: call.usage.inputTokens,
-            cacheReadTokens: call.usage.cacheReadTokens,
-            cacheWriteTokens: call.usage.cacheWriteTokens, hitRate: call.usage.hitRate,
-            summary: `第 ${call.turn} 轮 / 步骤 ${call.step}：缓存大规模未命中`,
-            lossTokens: Math.round(lossTokens), lossRatio, estimated: true,
-            previousPromptTokens: oldPrompt,
-            changes: difference.changes,
-            cause: observed.length ? 'observed-prefix-change' : unknown ? 'comparison-unknown' : 'upstream-unknown',
-            reason: observed.length
-              ? '观察到请求前缀变化，可能导致旧上下文缓存未命中，需要分析确认。'
-              : unknown ? '输入重建或适配投影不完整，无法可靠归因，需要分析确认。'
-                : '未观察到客户端旧前缀变化，可能为服务端过期、淘汰或其他原因，需要分析确认。',
-            ...(unknown ? { unknown: true } : {}),
-            recovered: false,
-          };
-          warnings.push(warning);
-        }
+      comparison = { ...neutral, changes: retainedChanges(neutral.changes),
+        ...(neutral.message ? { message: diagnostic(neutral.message) } : {}) };
+    }
+    calls.push({
+      turn: call.turn, step: call.step, seq: call.seq, at: call.at,
+      provider: call.provider, model: call.model, inherited: inherited(call.seq),
+      settlement: call.settlement, usage: call.usage,
+      baseline: selectReceiptBaseline(records, { ...config, receiptSeqs }),
+      previousPromptTokens: previous?.call.usage.promptTokens ?? null,
+      comparison: comparison ?? null,
+      comparisonUnknown: previous ? !currentInput.comparable || !previous.input.comparable : false,
+      expectedRebuild: Boolean(previous && lastCompactionSeq > previous.call.seq),
+      ...(call.unknown || currentInput.unknown ? { unknown: diagnostic(call.unknown ?? currentInput.unknown) } : {}),
+    });
+    // Nonempty failed streams without usage remain calls with unknown accounting,
+    // but cannot establish a successful request baseline for the following call.
+    if (call.settlement === 'assistant/message' || call.usage.reported) {
+      previous = { call, input: currentInput };
+      receiptSeqs.push(call.seq);
+    }
+    yield null;
+  }
+  return { schema: FACTS_SCHEMA_VERSION, analyzerVersion: ANALYZER_VERSION, sessionId,
+    accounting, calls, baseline: selectReceiptBaseline(records, { ...config, receiptSeqs }) };
+}
+
+function consume(iterator) {
+  let step;
+  do { step = iterator.next(); } while (!step.done);
+  return step.value;
+}
+
+function aborted(signal) {
+  if (signal?.aborted) {
+    const error = new Error('本地分析已取消');
+    error.name = 'AbortError';
+    error.code = 'ABORT_ERR';
+    throw error;
+  }
+}
+
+async function consumeAsync(iterator, options = {}) {
+  const { signal, sliceEvents = 128, sliceMs = 8, scheduler = yieldImmediate } = options;
+  if (!Number.isSafeInteger(sliceEvents) || sliceEvents < 1 || !Number.isFinite(sliceMs) || sliceMs <= 0)
+    throw new TypeError('Invalid analysis slice budget');
+  let processed = 0;
+  let started = performance.now();
+  try {
+    while (true) {
+      aborted(signal);
+      const step = iterator.next();
+      aborted(signal);
+      if (step.done) return step.value;
+      processed++;
+      if (processed >= sliceEvents || performance.now() - started >= sliceMs) {
+        await scheduler();
+        aborted(signal);
+        processed = 0;
+        started = performance.now();
+      }
+    }
+  } finally {
+    iterator.return?.();
+  }
+}
+
+export function extractSessionFacts(records, config = {}) {
+  return consume(iterateFacts(records, config));
+}
+
+export function extractSessionFactsAsync(records, config = {}, options = {}) {
+  return consumeAsync(iterateFacts(records, config), options);
+}
+
+function* iterateDerivation(facts, config) {
+  if (facts?.schema !== FACTS_SCHEMA_VERSION || facts.analyzerVersion !== ANALYZER_VERSION)
+    throw new TypeError('Unsupported analysis facts schema');
+  const resolved = setting(config);
+  const { accounting, sessionId } = facts;
+  const calls = [];
+  const warnings = [];
+  const turns = new Map();
+  const sums = { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
+  const complete = { inputTokens: true, cacheReadTokens: true, cacheWriteTokens: true, outputTokens: true };
+  let knownRead = 0;
+  let prompt = 0;
+  let cacheKnownCalls = 0;
+  let missingUsageCalls = 0;
+  let unknownCalls = 0;
+  for (const fact of facts.calls) {
+    const call = { ...fact, usage: { ...fact.usage } };
+    const difference = fact.comparison;
+    const oldPrompt = fact.previousPromptTokens;
+    const currentRead = call.usage.cacheReadTokens;
+    let warning;
+    if (difference && oldPrompt !== null && currentRead !== null && call.usage.reported) {
+      const lossTokens = Math.max(0, oldPrompt - currentRead);
+      const lossRatio = oldPrompt > 0 ? lossTokens / oldPrompt : 0;
+      if (lossTokens >= resolved.minLostTokens && lossRatio >= resolved.minLossRatio) {
+        const changes = retainedChanges(difference.changes);
+        const observed = changes.filter(change => change.kind !== 'unknown' && !change.preservesPrefix);
+        const unknown = fact.comparisonUnknown;
+        warning = {
+          id: `${sessionId ?? 'session'}:${call.seq}`,
+          turn: call.turn, step: call.step, seq: call.seq, at: call.at,
+          provider: call.provider, model: call.model, inherited: call.inherited,
+          category: fact.expectedRebuild ? 'expected-rebuild' : 'unexpected-loss',
+          usage: call.usage,
+          inputTokens: call.usage.inputTokens, missTokens: call.usage.inputTokens,
+          cacheReadTokens: call.usage.cacheReadTokens,
+          cacheWriteTokens: call.usage.cacheWriteTokens, hitRate: call.usage.hitRate,
+          summary: `第 ${call.turn} 轮 / 步骤 ${call.step}：缓存大规模未命中`,
+          lossTokens: Math.round(lossTokens), lossRatio, estimated: true,
+          previousPromptTokens: oldPrompt, changes,
+          cause: observed.length ? 'observed-prefix-change' : unknown ? 'comparison-unknown' : 'upstream-unknown',
+          reason: observed.length
+            ? '观察到请求前缀变化，可能导致旧上下文缓存未命中，需要分析确认。'
+            : unknown ? '输入重建或适配投影不完整，无法可靠归因，需要分析确认。'
+              : '未观察到客户端旧前缀变化，可能为服务端过期、淘汰或其他原因，需要分析确认。',
+          ...(unknown ? { unknown: true } : {}), recovered: false,
+        };
+        warnings.push(warning);
       }
     }
     if (!warning && call.usage.hitRate !== null && call.usage.hitRate >= 0.8) {
@@ -198,39 +309,63 @@ export function analyzeSession(records, config = {}) {
           old.recovered = true;
           old.recoveredAt = { seq: call.seq, turn: call.turn, step: call.step, at: call.at };
         }
+        yield null;
       }
     }
-    calls.push({
+    const result = {
       turn: call.turn, step: call.step, seq: call.seq, at: call.at,
-      provider: call.provider, model: call.model, inherited: inherited(call.seq),
-      category: warning?.category ?? (previous ? 'ordinary' : 'cold-start'),
+      provider: call.provider, model: call.model, inherited: call.inherited,
+      category: warning?.category ?? (difference ? 'ordinary' : 'cold-start'),
       settlement: call.settlement, usage: call.usage,
-      changes: difference?.changes ?? [],
+      changes: retainedChanges(difference?.changes ?? []), baseline: { ...fact.baseline },
       ...(warning ? { warningId: warning.id } : {}),
-      ...(call.unknown || currentInput.unknown ? { unknown: call.unknown ?? currentInput.unknown } : {}),
-    });
-    // A successful message is an actual model receipt; usage-bearing failed
-    // attempts are also billable. Pure cancellation/error logs are not baselines.
-    if (call.settlement === 'assistant/message' || call.usage.reported) previous = { call, input: currentInput };
+      ...(call.unknown ? { unknown: call.unknown } : {}),
+    };
+    calls.push(result);
+    turns.set(call.turn, { turn: call.turn, latest: call.usage,
+      seq: call.seq, step: call.step, at: call.at, settlement: call.settlement,
+      ...(warning ? { warningId: warning.id } : {}),
+      ...(call.unknown ? { unknown: call.unknown } : {}) });
+    for (const field of Object.keys(sums)) {
+      sums[field] += call.usage[field] ?? 0;
+      complete[field] &&= call.usage[field] !== null;
+    }
+    if (call.usage.promptTokens !== null) {
+      cacheKnownCalls++; prompt += call.usage.promptTokens; knownRead += call.usage.cacheReadTokens;
+    }
+    if (!call.usage.reported) missingUsageCalls++;
+    if (call.unknown) unknownCalls++;
+    yield null;
   }
-  // Each answer footer describes the last actual input of its own turn. Reuse
-  // the settled call's metrics; never sum steps or fall back to another turn
-  // when the final call has missing cache counters.
-  const turns = new Map();
-  for (const call of calls) turns.set(call.turn, {
-    turn: call.turn, latest: call.usage,
-    seq: call.seq, step: call.step, at: call.at, settlement: call.settlement,
-    ...(call.warningId ? { warningId: call.warningId } : {}),
-    ...(call.unknown ? { unknown: call.unknown } : {}),
-  });
   return {
-    sessionId,
-    role: accounting.role, ownership: accounting.ownership,
+    sessionId, role: accounting.role, ownership: { ...accounting.ownership },
+    identity: { ...accounting.identity }, baseline: { ...facts.baseline },
     auxiliaryCalls: accounting.auxiliaryCalls,
     auxiliaryCoverage: accounting.auxiliaryCoverage, emptyAttempts: accounting.emptyAttempts,
     latest: calls.at(-1)?.usage ?? null,
-    cumulative: cumulativeUsage(calls), calls, turns: [...turns.values()], warnings,
-    coverage: { adapter: 'deepseek-messages-text', estimatedPrefixTokens: true,
-      unknownCalls: calls.filter(call => call.unknown).length },
+    cumulative: {
+      ...Object.fromEntries(Object.keys(sums).map(field => [field, complete[field] ? sums[field] : null])),
+      knownCacheReadTokens: sums.cacheReadTokens,
+      promptTokens: cacheKnownCalls === calls.length ? prompt : null,
+      hitRate: cacheKnownCalls === calls.length && prompt > 0 ? sums.cacheReadTokens / prompt : null,
+      knownHitRate: prompt > 0 ? knownRead / prompt : null,
+      calls: calls.length, cacheKnownCalls, missingUsageCalls,
+    },
+    calls, turns: [...turns.values()], warnings,
+    coverage: { adapter: 'deepseek-messages-text', estimatedPrefixTokens: true, unknownCalls },
   };
+}
+
+/** Threshold and presentation policy can change without replaying old inputs. */
+export function deriveSessionAnalysis(facts, config = {}) {
+  return consume(iterateDerivation(facts, config));
+}
+
+export function deriveSessionAnalysisAsync(facts, config = {}, options = {}) {
+  return consumeAsync(iterateDerivation(facts, config), options);
+}
+
+/** Public result contains metrics and limited cause metadata, never prompts. */
+export function analyzeSession(records, config = {}) {
+  return deriveSessionAnalysis(extractSessionFacts(records, config), config);
 }

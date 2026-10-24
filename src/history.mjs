@@ -2,6 +2,7 @@ import { Session } from '@deepseek-ai/dsh-session';
 import { SurfaceManager } from '@deepseek-ai/dsh-session/surface';
 import { lastAssistantStreamChunk, projectToolUpdates } from '@deepseek-ai/dsh-llm';
 import { createHash } from 'node:crypto';
+import { inheritanceCut, sessionIdentity } from './session-identity.mjs';
 
 /** The records remain borrowed from Session; no durable prompt copy is made. */
 export function splitRecords(records) {
@@ -40,7 +41,7 @@ function eventUsage(event) {
  * plugin-supplied message projections. Tool history is rebuilt only when its
  * small set of governing events changes, then reused for ordinary steps.
  */
-export function* iterateCalls(records, config = {}) {
+export function* iterateCallSteps(records, config = {}) {
   const { header: storage, events } = splitRecords(records);
   const prefix = [];
   const projections = config.messageProjections ?? config.projections ?? [];
@@ -82,7 +83,7 @@ export function* iterateCalls(records, config = {}) {
           unknown = error instanceof Error ? error.message : '历史输入重建失败';
         }
       }
-      yield {
+      yield { call: {
         turn: event.data?.turn, step: event.data?.step, seq: event.seq,
         at: event.time, settlement: event.type,
         provider: event.data?.message?.source?.provider ?? header?.config?.provider ?? null,
@@ -92,7 +93,7 @@ export function* iterateCalls(records, config = {}) {
         }),
         ...(request ? { request } : {}),
         ...(unknown ? { unknown } : {}),
-      };
+      } };
     }
     if (event.type === 'request/header') { header = event.data?.header; toolsDirty = true; }
     if (event.type === 'request/context') context = event.data;
@@ -102,38 +103,62 @@ export function* iterateCalls(records, config = {}) {
       catch (error) { failure = error instanceof Error ? error.message : 'Session surface 重建失败'; }
     }
     prefix.push(event);
+    // Checkpoints cover events without receipts as well as actual calls.
+    yield null;
+  }
+}
+
+export function* iterateCalls(records, config = {}) {
+  for (const checkpoint of iterateCallSteps(records, config)) {
+    if (checkpoint?.call) yield checkpoint.call;
   }
 }
 
 /** Read only recorded accounting facts; unknown auxiliary work is never free. */
-export function sessionAccounting(records) {
-  const { header, events } = splitRecords(records);
-  const suppliedCut = header?.inheritedEventCount;
-  const validCut = Number.isSafeInteger(suppliedCut) && suppliedCut >= 0 && suppliedCut <= events.length
-    && (header?.isSeeded === true || suppliedCut === 0);
-  const cut = validCut ? suppliedCut : suppliedCut !== undefined || header?.isSeeded ? null : 0;
+export function* iterateAccountingSteps(records, config = {}) {
+  const { events } = splitRecords(records);
+  const ownership = inheritanceCut(records);
+  const cut = ownership.inheritedEventCount;
+  const identity = sessionIdentity(records, config);
   const inherited = seq => cut === null ? null : seq < cut;
   const starts = new Map();
   const ends = new Map();
+  const emptyAttempts = [];
   for (const event of events) {
     if (event.type === 'compaction/start') starts.set(event.data?.compactionId, event);
     if (event.type === 'compaction/end') ends.set(event.data?.compactionId, event);
+    if (event.type === 'assistant/attempt' && eventUsage(event) === undefined && !event.data?.stream?.length) {
+      emptyAttempts.push({ seq: event.seq, at: event.time, turn: event.data?.turn,
+        step: event.data?.step, inherited: inherited(event.seq), dispatch: 'unknown' });
+    }
+    yield null;
   }
   const auxiliaryCalls = [];
   const unrecorded = [];
   const summaries = new Set();
-  for (const event of events) {
+  const compactionSeqs = [];
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    // A checkpoint before continue also makes long non-summary logs cancellable.
+    yield null;
     if (event.type !== 'compaction/summary') continue;
     const data = event.data ?? {};
     const start = starts.get(data.compactionId);
     const end = ends.get(data.compactionId);
     summaries.add(data.compactionId);
+    // Log-only summaries predict rebuilding only if a linked surface replacement landed.
+    const replacement = events[index + 1];
+    const range = data.shadowedRange;
+    const operation = replacement?.surfaceOp;
+    if (replacement?.type === 'user/message' && operation?.op === 'replace' && range && start
+      && operation.startSeq === range.start && operation.endSeq === range.end
+      && replacement.sourceEventSeqs?.includes(event.seq) && replacement.sourceEventSeqs?.includes(start.seq)) {
+      compactionSeqs.push(replacement.seq);
+    }
     const position = { seq: event.seq, at: event.time, atSource: 'session-summary-settlement',
-      inherited: inherited(event.seq),
-      compactionId: data.compactionId ?? null, purpose: 'compaction',
+      inherited: inherited(event.seq), compactionId: data.compactionId ?? null, purpose: 'compaction',
       provider: data.provider ?? null, model: data.model ?? null };
-    // An unmarked template/remote summary is not proof of an LLM call. A
-    // reported usage or an explicit stream-call witness is accounting evidence.
+    // Template summaries are not evidence of a billable model call.
     if (data.llmStreamCall !== true && data.usage === undefined) {
       unrecorded.push({ ...position, reason: 'summary-without-call-receipt' });
       continue;
@@ -141,13 +166,13 @@ export function sessionAccounting(records) {
     const elapsed = start && end && Number.isFinite(start.time) && Number.isFinite(end.time)
       && end.time >= start.time ? end.time - start.time : null;
     auxiliaryCalls.push({ ...position, settlement: 'compaction/summary', role: 'auxiliary',
-      usage: normalizeUsage(data.usage),
-      operationElapsedMs: elapsed, durationSource: elapsed === null ? null : 'compaction-lifecycle',
-      modelDurationMs: null, // The lifecycle includes non-model work; do not relabel it.
+      usage: normalizeUsage(data.usage), operationElapsedMs: elapsed,
+      durationSource: elapsed === null ? null : 'compaction-lifecycle', modelDurationMs: null,
       outcome: 'completed', operationOutcome: end?.data?.error ? 'partial' : end ? 'completed' : 'pending',
       recording: data.llmStreamCall === true ? 'local-stream' : 'reported-usage' });
   }
   for (const [id, start] of starts) {
+    yield null;
     if (summaries.has(id)) continue;
     const end = ends.get(id);
     unrecorded.push({ seq: start.seq, at: start.time, inherited: inherited(start.seq),
@@ -155,29 +180,19 @@ export function sessionAccounting(records) {
       reason: end ? 'compaction-without-summary-receipt' : 'compaction-in-progress' });
   }
   return {
-    role: header?.origin === 'subagent' || header?.delegationDepth > 0 ? 'sub' : 'main',
-    ownership: { inheritedEventCount: cut, known: cut !== null },
+    role: identity.role, ownership, identity,
     auxiliaryCalls,
     auxiliaryCoverage: { complete: false, unrecorded,
       reason: '仅统计 Session 已记录的辅助回执；其他辅助调用及失败摘要可能没有用量记录。' },
-    emptyAttempts: events.filter(event => event.type === 'assistant/attempt'
-      && eventUsage(event) === undefined && !event.data?.stream?.length)
-      .map(event => ({ seq: event.seq, at: event.time, turn: event.data?.turn,
-        step: event.data?.step, inherited: inherited(event.seq), dispatch: 'unknown' })),
-    // A summary is log-only. Cache rebuilding is expected only after its
-    // adjacent, source-linked surface replacement actually changed history.
-    compactionSeqs: events.flatMap((event, index) => {
-      if (event.type !== 'compaction/summary') return [];
-      const replacement = events[index + 1];
-      const range = event.data?.shadowedRange;
-      const operation = replacement?.surfaceOp;
-      const start = starts.get(event.data?.compactionId);
-      return replacement?.type === 'user/message' && operation?.op === 'replace' && range && start
-        && operation.startSeq === range.start && operation.endSeq === range.end
-        && replacement.sourceEventSeqs?.includes(event.seq) && replacement.sourceEventSeqs?.includes(start.seq)
-        ? [replacement.seq] : [];
-    }),
+    emptyAttempts, compactionSeqs,
   };
+}
+
+export function sessionAccounting(records, config = {}) {
+  const iterator = iterateAccountingSteps(records, config);
+  let step;
+  do { step = iterator.next(); } while (!step.done);
+  return step.value;
 }
 
 /** Internal/testing API; callers must not expose raw request content in UI DTOs. */
@@ -216,7 +231,7 @@ export function latestReceiptSeq(records) {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index];
     if (event.type === 'assistant/message'
-      || (event.type === 'assistant/attempt' && eventUsage(event) !== undefined)) return event.seq;
+      || (event.type === 'assistant/attempt' && eventUsage(event) != null)) return event.seq;
   }
   return null;
 }

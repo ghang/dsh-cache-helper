@@ -81,6 +81,12 @@ node scripts/replay-session.mjs /absolute/path/session.v4.jsonl.zstd
 
 `analyzeSession(records, config)` 返回派生指标，不对前端返回完整上下文。内部分析函数会随候选演进，当前不承诺独立于宿主版本的稳定外部 API。
 
+下一迭代 P0 的 `extractSessionFacts[Async]()` 只保留用量、身份、比较数值/hash 与有限诊断，`deriveSessionAnalysis[Async]()` 根据阈值派生告警和恢复；同步 `analyzeSession()` 组合两者。异步版本在事件、调用和恢复扫描边界检查 signal，默认每 128 个检查点或约 8ms 让出事件循环；单次宿主投影/规范化仍同步，该预算不是硬延迟上限。
+
+`SessionRepository` 使用进程内 `AnalysisService` 共享相同来源切点和投影实现的计算。每个消费者独立订阅/取消；全部退出才 abort 共同计算。策略变更复用中性事实，历史结果不会批准实时发送。持久化 revision 只在同一后端 service identity 内比较，live 缓存还区分 Session 对象生命周期；较早切点完成不覆盖较新结果。冷读取将 signal 传入 stat/open/read 并在 finally 关闭 handle，读取期间变源明确拒绝；计算期间新增事件只标记结果落后，不无界追算。
+
+P0 尚未添加分析磁盘缓存、append 增量、批量任务 API 或子门禁。已有 live 父链可从轻量 header 补齐；冷祖先缺失和 activation 未接公开运行时快照时仍为未知，不激活 Agent 补证。基线的继承用量只用于风险尺度，统计仍按原有继承切点去重。
+
 | 字段 | 语义 |
 |---|---|
 | `latest` | 会话最近一次实际调用的 usage；字段缺失保持未知 |
@@ -89,6 +95,9 @@ node scripts/replay-session.mjs /absolute/path/session.v4.jsonl.zstd
 | `cumulative` | 会话累计指标；按输入 Token 加权，存在未知缓存字段时完整累计率保持未知 |
 | `warnings` | 旧前缀大规模实际 miss 的估计、观察到的差异和可能原因；恢复不会删掉历史 |
 | `role` / `ownership` | 主/子会话与继承事件归属；未知归属不进入全局已知用量 |
+| `identity` / `baseline` | 目标、直接父/根、深度与可证实的代际；own/inherited/none/unknown 回执基线，未知不猜测 |
+| `sourceCut` / `analyzerVersion` / `policyVersion` | 固定分析水位、进程内来源/生命周期、分析器与派生策略版本；来源 token 不能跨重启比较 |
+| `generatedAt` / `cacheStatus` / `hasNewEvents` | 事实生成时间，computed/shared/memory 计算来源，以及结果是否落后于已观察来源 |
 | `auxiliaryCalls` / `auxiliaryCoverage` | 已记录摘要调用与未记录辅助操作的覆盖缺口；操作回执补充失败/取消调用时按分支和摘要标识去重 |
 | `coverage` | 已覆盖适配路径及重建未知情况，不能据此宣称覆盖所有模型和附件 |
 
