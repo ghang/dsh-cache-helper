@@ -58,7 +58,7 @@ export function* iterateCallSteps(records, config = {}) {
         && (eventUsage(event) !== undefined || event.data?.stream?.length > 0))) {
       let request;
       let unknown = failure;
-      if (!unknown) {
+      if (!unknown && !(event.seq < (config.skipCallBeforeSeq ?? -1))) {
         try {
           if (!header) throw new Error('缺少 request/header，无法重建实际模型输入');
           if (toolsDirty) {

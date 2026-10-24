@@ -3,6 +3,8 @@ import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { AnalysisService, analysisAborted } from './analysis-service.mjs';
+import { FactCache } from './fact-cache.mjs';
+import { ACCOUNTING_PROJECTION_KEY, accountingProjectionSchema, installAccountingProjection } from './accounting-projection.mjs';
 import { aggregateStatistics } from './statistics.mjs';
 
 export function liveRecords(session) {
@@ -10,10 +12,13 @@ export function liveRecords(session) {
 }
 
 export function requestRevision(records) {
-  for (let index = records.length - 1; index > 0; index--) {
+  const start = records[0]?.type === 'session' ? 1 : 0;
+  for (let index = records.length - 1; index >= start; index--) {
     const event = records[index];
     if (event.surfaceOp !== undefined || event.type === 'request/header' || event.type === 'request/context') return event.seq;
   }
+
+
   return -1;
 }
 
@@ -27,6 +32,7 @@ function titleOf(records) {
 const headerDigest = header => header ? createHash('sha256')
   .update(JSON.stringify(Object.fromEntries(Object.keys(header).sort().map(key => [key, header[key]])))).digest('hex') : null;
 const limited = () => Object.assign(new Error('会话事件数超过本地分析上限。'), { status: 413 });
+const byteLimited = () => Object.assign(new Error('会话字节数超过本地分析预算。'), { status: 413, code: 'CACHE_HELPER_BYTE_LIMIT' });
 const changed = () => Object.assign(new Error('分析读取期间会话来源发生变化，请重新分析。'), {
   status: 409, code: 'CACHE_HELPER_SOURCE_CHANGED',
 });
@@ -39,13 +45,48 @@ export class SessionRepository {
   #dashboardAt = 0;
   #order = 0;
   #disposed = false;
+  #projectionDispose;
+  #lastObserved = new Map();
   policyVersion = 1;
 
   constructor(ctx, config) {
     this.ctx = ctx;
     this.config = config;
-    this.analysis = new AnalysisService({ maxCachedSessions: config.maxCachedSessions });
     this.statePath = config.statePath ?? join(resolveDshHome(), 'storages', 'cache-helper', 'web-state.json');
+    this.factCache = config.persistState === false || config.persistAnalysisCache === false ? undefined : new FactCache({
+      directory: config.analysisCachePath ?? join(dirname(this.statePath), 'analysis-cache-v1'),
+    });
+    this.analysis = new AnalysisService({ maxCachedSessions: config.maxCachedSessions, factCache: this.factCache });
+  }
+
+  #dependencies(header, config = this.config) {
+    const projections = [...(this.ctx.sessions.messageProjections ?? [])];
+    const parentHeaders = new Map();
+    let parentId = header?.parentSession;
+    for (let hops = 0; parentId && !parentHeaders.has(parentId) && hops < 128; hops++) {
+      const parent = this.ctx.sessions.get(parentId);
+      if (!parent) break;
+      parentHeaders.set(parentId, { ...parent.header,
+        inheritedEventCount: parent.inheritedEventCount ?? (parent.header?.isSeeded ? null : 0) });
+      parentId = parent.header?.parentSession;
+    }
+    const historical = config.historicalCapabilities;
+    return { analysisConfig: { ...config, messageProjections: projections, parentHeaders },
+      dependencyKey: JSON.stringify({ projections: projections.map(item => [item.type, this.analysis.reference(item.project)]),
+        historical: typeof historical === 'function' ? this.analysis.reference(historical) : historical,
+        lineage: [...parentHeaders].map(([id, value]) => [id, headerDigest(value)]) }) };
+  }
+
+  #summary(header, live) {
+    try {
+      const snapshot = live
+        ? this.ctx.get?.('sessionProjections')?.cachedSnapshot(live, [ACCOUNTING_PROJECTION_KEY])
+        : this.ctx.get?.('sessionProjectionCache')?.cachedSnapshot(header, [ACCOUNTING_PROJECTION_KEY]);
+      const parsed = accountingProjectionSchema.safeParse(snapshot?.values?.[ACCOUNTING_PROJECTION_KEY]);
+      if (!parsed.success || parsed.data.sessionId !== header.id || !Number.isSafeInteger(snapshot.asOfSeq)
+        || snapshot.asOfSeq < -1 || live && parsed.data.inheritedEventCount !== live.inheritedEventCount) return null;
+      return { ...parsed.data, asOfSeq: snapshot.asOfSeq };
+    } catch { return null; }
   }
 
   updatePolicy(config, version) {
@@ -57,6 +98,8 @@ export class SessionRepository {
   }
 
   async init() {
+    await this.factCache?.init();
+    this.#projectionDispose = await installAccountingProjection(this.ctx);
     if (this.config.persistState === false) return;
     try {
       const state = JSON.parse(await readFile(this.statePath, 'utf8'));
@@ -66,6 +109,62 @@ export class SessionRepository {
     } catch (error) {
       if (error.code !== 'ENOENT') this.ctx.logger?.warn?.('cache-helper: cannot read dismissal state; Session metrics remain available');
     }
+  }
+
+  /** Listing hints use metadata only; unvalidated disk results stay stale. */
+  analysisStatus(header, metadata = {}) {
+    const id = typeof header === 'string' ? header : header.id;
+    const state = this.analysis.analysisStatus(id, typeof header === 'string' ? undefined : header);
+    const observed = this.#lastObserved.get(id);
+    const live = this.ctx.sessions.get(id);
+    const currentHeader = typeof header === 'string' ? live?.header : header;
+    if (state.state === 'none') {
+      const summary = currentHeader && this.#summary(currentHeader, live);
+      return observed || summary ? { ...state, state: 'stale', reason: 'details-not-retained',
+        generatedAt: observed?.generatedAt, lastSeq: observed?.lastSeq ?? summary?.asOfSeq,
+        summaryAvailable: Boolean(summary) } : state;
+    }
+    const eventCount = metadata.eventCount ?? live?.seq;
+    let current = false;
+    const dependencyMatches = observed?.dependencyKey === this.#dependencies(currentHeader).dependencyKey;
+    if (live && Number.isSafeInteger(eventCount)) current = state.memory === true && state.eventCount === eventCount
+      && live.seq === eventCount && observed?.source === 'live' && observed.lifecycle === this.analysis.reference(live)
+      && observed.contentGeneration === live.surface?.contentGeneration && dependencyMatches;
+    else if (!live && observed && metadata.revision !== undefined) {
+      const persistence = this.ctx.get?.('sessionPersistence');
+      current = state.memory === true && observed.source === 'persistence' && observed.revision === metadata.revision && dependencyMatches
+        && observed.serviceInstance === this.analysis.reference(persistence?.identity ?? persistence);
+    }
+    return { ...state, state: current ? 'cached' : 'stale', reason: current ? 'observed-current-cut' : state.reason ?? 'source-not-validated' };
+  }
+
+  async cachedSession(sessionId, { signal } = {}) {
+    if (this.#disposed || signal?.aborted) throw analysisAborted();
+    const live = this.ctx.sessions.get(sessionId);
+    const snapshot = live ? undefined : await this.ctx.get?.('sessionPersistence')?.stat(sessionId, { signal });
+    signal?.throwIfAborted();
+    const header = live?.header ?? snapshot?.header;
+    if (!header) return null;
+    const status = this.analysis.analysisStatus(sessionId, header);
+    if (status.reason === 'lifecycle-changed') return null;
+    const data = status.eventCount > this.config.maxEvents ? undefined : await this.analysis.cached(sessionId, {
+      header, ...(live ? { inheritedEventCount: live.inheritedEventCount } : {}), config: this.config,
+      policyVersion: this.policyVersion, signal });
+    if (!data) {
+      const summary = this.#summary(header, live);
+      if (!summary) return null;
+      return { sessionId, title: sessionId, role: summary.role,
+        ownership: { known: summary.inheritedEventCount !== null, inheritedEventCount: summary.inheritedEventCount },
+        latest: null, cumulative: null, calls: [], turns: [], warnings: [], accountingSummary: summary,
+        sourceCut: { sessionId, source: 'accounting-projection', validation: 'unverified',
+          lastSeq: summary.asOfSeq < 0 ? null : summary.asOfSeq, eventCount: summary.asOfSeq + 1 },
+        cacheStatus: 'stale-summary', stale: true, policyVersion: this.policyVersion,
+        coverage: { cached: true, validated: false, partial: true, detailsAvailable: false, reason: 'details-not-retained' } };
+    }
+    return { ...data, title: sessionId, cwd: live?.header?.cwd, stale: true,
+      config: { minLostTokens: this.config.minLostTokens, minLossRatio: this.config.minLossRatio },
+      warnings: (data.warnings ?? []).map(warning => ({ ...warning,
+        dismissed: this.#dismissed.has(`${sessionId}:${warning.id}`) })) };
   }
 
   async records(sessionId, config = this.config, { signal } = {}) {
@@ -89,10 +188,12 @@ export class SessionRepository {
     }
   }
 
-  async session(sessionId, { signal } = {}) {
+  async session(sessionId, { signal, mode = 'reuse', maxEvents, maxBytes = 32 * 1024 * 1024 } = {}) {
     if (this.#disposed || signal?.aborted) throw analysisAborted();
+    if (maxEvents !== undefined && (!Number.isSafeInteger(maxEvents) || maxEvents < 0)
+      || !Number.isSafeInteger(maxBytes) || maxBytes < 0) throw Object.assign(new Error('分析预算无效。'), { status: 400 });
     const order = ++this.#order;
-    const config = this.config;
+    const config = { ...this.config, maxEvents: maxEvents === undefined ? this.config.maxEvents : Math.min(this.config.maxEvents, maxEvents) };
     const policyVersion = this.policyVersion;
     const live = this.ctx.sessions.get(sessionId);
     const persistence = this.ctx.get?.('sessionPersistence');
@@ -103,26 +204,12 @@ export class SessionRepository {
     const snapshot = live ? undefined : await persistence.stat(sessionId, { signal });
     signal?.throwIfAborted();
     const eventCount = events?.length ?? snapshot?.eventCount;
+    const sizeBytes = Number.isSafeInteger(snapshot?.sizeBytes) && snapshot.sizeBytes >= 0 ? snapshot.sizeBytes : null;
     if (eventCount > config.maxEvents) throw limited();
-    const projections = [...(this.ctx.sessions.messageProjections ?? [])];
+    if (sizeBytes !== null && sizeBytes > maxBytes) throw byteLimited();
     // Use only already-live parent metadata here. Missing cold ancestry stays
     // unknown; analysis never activates an Agent to fill a relationship gap.
-    const parentHeaders = new Map();
-    let parentId = (live?.header ?? snapshot?.header)?.parentSession;
-    for (let hops = 0; parentId && !parentHeaders.has(parentId) && hops < 128; hops++) {
-      const parent = this.ctx.sessions.get(parentId);
-      if (!parent) break;
-      parentHeaders.set(parentId, { ...parent.header,
-        inheritedEventCount: parent.inheritedEventCount ?? (parent.header?.isSeeded ? null : 0) });
-      parentId = parent.header?.parentSession;
-    }
-    const analysisConfig = { ...config, messageProjections: projections, parentHeaders };
-    const historical = config.historicalCapabilities;
-    const dependencyKey = JSON.stringify({
-      projections: projections.map(item => [item.type, this.analysis.reference(item.project)]),
-      historical: typeof historical === 'function' ? this.analysis.reference(historical) : historical,
-      lineage: [...parentHeaders].map(([id, header]) => [id, headerDigest(header)]),
-    });
+    const { analysisConfig, dependencyKey } = this.#dependencies(live?.header ?? snapshot?.header, config);
     const sourceCut = Object.freeze({
       sessionId, source: live ? 'live' : 'persistence',
       serviceInstance: this.analysis.reference(live ? this.ctx.sessions : persistence.identity ?? persistence),
@@ -130,12 +217,13 @@ export class SessionRepository {
       headerDigest: headerDigest(live?.header ?? snapshot?.header),
       revision: live ? events.length : snapshot?.revision ?? `unverified-${++this.#order}`,
       eventCount: eventCount ?? null,
+      sizeBytes: live ? null : sizeBytes,
       lastSeq: events ? events.at(-1)?.seq ?? null : null,
       inheritedEventCount: live ? live.inheritedEventCount ?? (live.header?.isSeeded ? null : 0) : null,
       contentGeneration: live?.surface?.contentGeneration ?? null,
     });
     const value = await this.analysis.analyze({ sessionId, sourceCut, dependencyKey, config: analysisConfig,
-      policyVersion, signal, order,
+      policyVersion, signal, order, mode,
       load: async sharedSignal => {
         let records;
         if (live) records = [{ type: 'session', ...live.header,
@@ -157,13 +245,28 @@ export class SessionRepository {
             || (snapshot.header && headerDigest(records[0]) !== headerDigest({ type: 'session', ...snapshot.header,
               inheritedEventCount: records[0].inheritedEventCount })))) throw changed();
         }
+        sharedSignal.throwIfAborted();
+        try {
+          if (live) this.ctx.get?.('sessionProjections')?.snapshot(live, [ACCOUNTING_PROJECTION_KEY]);
+          else if (Number.isSafeInteger(records[0].inheritedEventCount)) {
+            const { type, inheritedEventCount, ...meta } = records[0];
+            this.ctx.get?.('sessionProjectionCache')?.coldSnapshot(meta, inheritedEventCount, records.slice(1));
+          }
+        } catch { /* Projection persistence is optional, bounded and fail-soft. */ }
+        sharedSignal.throwIfAborted();
         return { records, metadata: { sessionId, title: titleOf(records), cwd: records[0].cwd },
           sourceCut: { eventCount: records.length - 1, lastSeq: records.at(-1)?.seq ?? null,
             inheritedEventCount: records[0].inheritedEventCount ?? (records[0].isSeeded ? null : 0) } };
       },
     });
     if (value.sourceCut.eventCount > config.maxEvents) throw limited();
-    if (policyVersion !== this.policyVersion) return this.session(sessionId, { signal });
+    if (policyVersion !== this.policyVersion) return this.session(sessionId, { signal, mode, maxEvents, maxBytes });
+    const previousObservation = this.#lastObserved.get(sessionId);
+    if (!previousObservation || order >= previousObservation.observationOrder) {
+      this.#lastObserved.delete(sessionId);
+      this.#lastObserved.set(sessionId, { ...value.sourceCut, observationOrder: order, dependencyKey, generatedAt: value.generatedAt });
+    }
+    while (this.#lastObserved.size > this.config.maxCachedSessions) this.#lastObserved.delete(this.#lastObserved.keys().next().value);
     const currentLive = this.ctx.sessions.get(sessionId);
     const currentPersistence = this.ctx.get?.('sessionPersistence');
     let hasNewEvents = live ? currentLive !== live || live.snapshotEvents().length !== sourceCut.eventCount
@@ -173,7 +276,7 @@ export class SessionRepository {
       hasNewEvents = afterAnalysis?.revision !== snapshot.revision;
     }
     return {
-      ...value, hasNewEvents,
+      ...value, hasNewEvents, coverage: { ...value.coverage, byteBudgetKnown: Number.isSafeInteger(sourceCut.sizeBytes) },
       config: { minLostTokens: config.minLostTokens, minLossRatio: config.minLossRatio },
       warnings: (value.warnings ?? []).map(warning => ({
         ...warning, dismissed: this.#dismissed.has(`${sessionId}:${warning.id}`),
@@ -286,6 +389,8 @@ export class SessionRepository {
   async dispose() {
     this.#disposed = true;
     await this.analysis.dispose();
+    await this.#projectionDispose?.();
+    this.#lastObserved.clear();
     await this.#write.catch(() => {});
     this.#dashboard = undefined;
   }

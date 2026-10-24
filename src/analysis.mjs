@@ -4,6 +4,7 @@ import {
 import { selectReceiptBaseline } from './session-identity.mjs';
 import { performance } from 'node:perf_hooks';
 import { setImmediate as yieldImmediate } from 'node:timers/promises';
+import { createHash } from 'node:crypto';
 
 export const DEFAULT_CONFIG = Object.freeze({ minLostTokens: 50_000, minLossRatio: 0.2 });
 const setting = config => ({ ...DEFAULT_CONFIG, ...config });
@@ -92,7 +93,20 @@ export function compareRequests(previousRequest, currentRequest, config = {}) {
 
 /** Rebuild only the latest receipt; failed/unreported candidates cannot replace it. */
 export function inspectNextRequest(records, options, config = {}) {
-  const seq = latestReceiptSeq(records);
+  const baseline = config.baseline ?? selectReceiptBaseline(records, config);
+  if (baseline.kind === 'none') return null;
+  if (baseline.kind === 'unknown') {
+    const current = normalizeRequest(options, config);
+    const recentSeq = latestReceiptSeq(records);
+    const recent = recentSeq === null ? null : reconstructCall(records, recentSeq, config);
+    const scale = recent?.usage.promptTokens ?? (current.comparable ? current.chars / 4 : null);
+    if (scale !== null && scale < setting(config).minLostTokens) return null;
+    return { baseline, baselineSeq: null, unknown: true, significant: true, estimated: true,
+      lossTokens: null, lossRatio: null, previousPromptTokens: recent?.usage.promptTokens ?? null,
+      fingerprint: current.fingerprint, changes: [{ kind: 'unknown', message: '继承切点或回执归属无法确认' }],
+      reason: '大上下文的继承基线无法确认，需要确认后发送。' };
+  }
+  const seq = baseline.seq;
   if (seq === null) return null;
   const previous = reconstructCall(records, seq, config);
   const risk = compareRequests(previous.request, options, {
@@ -109,15 +123,70 @@ export function inspectNextRequest(records, options, config = {}) {
     || (estimatedScale >= resolved.minLostTokens && (risk.lossRatio === null || risk.lossRatio >= resolved.minLossRatio)));
   if (!risk.significant && !unknownLarge) return null;
   return {
-    ...risk, baselineSeq: seq,
+    ...risk, baselineSeq: seq, baseline,
     turn: previous.turn, step: previous.step,
     ...(risk.unknown ? { reason: risk.message ?? '历史输入检查不完整，需要确认后发送。' } : {}),
     ...(previous.unknown ? { unknown: true, message: previous.unknown } : {}),
   };
 }
 
-export const ANALYZER_VERSION = 'p0-facts-v1';
-export const FACTS_SCHEMA_VERSION = 1;
+export const ANALYZER_VERSION = 'p1-facts-v2';
+export const FACTS_SCHEMA_VERSION = 2;
+const sha = value => createHash('sha256').update(value).digest('hex');
+
+function inputProof(input) {
+  if (!input.comparable) return { comparable: false, unknown: diagnostic(input.unknown),
+    provider: input.provider ?? null, model: input.model ?? null };
+  const history = historyText(input);
+  return { comparable: true, provider: input.provider ?? null, model: input.model ?? null,
+    chars: input.chars, textHash: sha(input.text), historyChars: history.length, historyHash: sha(history),
+    systemHash: sha(JSON.stringify(input.system)), fingerprint: input.fingerprint,
+    // Too many declarations force a clear miss instead of unbounded retention.
+    toolHashes: input.tools.length <= 128 && input.tools.every(tool => typeof tool.name === 'string' && tool.name.length <= 256) ? input.tools.map(tool => ({ name: tool.name,
+      hash: sha(JSON.stringify(tool)) })) : null };
+}
+
+function proofChanges(proof, current) {
+  if (!proof.toolHashes || current.tools.length > 128) return null;
+  const changes = [];
+  if (proof.provider !== (current.provider ?? null) || proof.model !== (current.model ?? null)) changes.push({ kind: 'route',
+    message: `提供方或模型变化：${proof.provider ?? '?'} / ${proof.model ?? '?'} → ${current.provider ?? '?'} / ${current.model ?? '?'}` });
+  const oldTools = new Map(proof.toolHashes.map(tool => [tool.name, tool.hash]));
+  const newTools = new Map(current.tools.map(tool => [tool.name, sha(JSON.stringify(tool))]));
+  const added = [...newTools.keys()].filter(name => !oldTools.has(name));
+  const removed = [...oldTools.keys()].filter(name => !newTools.has(name));
+  const changed = [...newTools.keys()].filter(name => oldTools.has(name) && oldTools.get(name) !== newTools.get(name));
+  const reordered = !added.length && !removed.length && !same([...oldTools.keys()], [...newTools.keys()]);
+  if (added.length || removed.length || changed.length || reordered) changes.push({ kind: 'tools',
+    message: '模型实际工具声明发生变化，可能破坏旧请求前缀', added, removed, changed, reordered });
+  if (proof.systemHash !== sha(JSON.stringify(current.system))) changes.push({ kind: 'system', message: '头部 system 内容发生变化' });
+  const history = historyText(current);
+  if (history.length < proof.historyChars || sha(history.slice(0, proof.historyChars)) !== proof.historyHash)
+    changes.push({ kind: 'history', message: '既有消息前缀被替换、截断或重新投影，可能与压缩或历史改写有关' });
+  return changes;
+}
+
+/** Return null on a mismatch that needs the exact previous input rebuilt. */
+function compareProof(proof, current, promptTokens) {
+  if (!proof) return null;
+  if (!proof.comparable || !current.comparable) return {
+    unknown: true, estimated: true, message: proof.unknown ?? current.unknown ?? '请求输入不可可靠比较',
+    lossTokens: null, lossRatio: null, previousPromptTokens: promptTokens, previousChars: proof.chars,
+    changes: [{ kind: 'unknown', message: proof.unknown ?? current.unknown ?? '请求重建不完整' }],
+    previousFingerprint: proof.fingerprint, fingerprint: current.fingerprint,
+  };
+  const changes = proofChanges(proof, current);
+  if (!changes) return null;
+  const routeChanged = proof.provider !== (current.provider ?? null) || proof.model !== (current.model ?? null);
+  if (!routeChanged && (current.chars < proof.chars || sha(current.text.slice(0, proof.chars)) !== proof.textHash)) return null;
+  const lossRatio = routeChanged && proof.chars > 0 ? 1 : 0;
+  const lossTokens = promptTokens === null ? null : Math.round(promptTokens * lossRatio);
+  if (lossRatio === 0) for (const change of changes) change.preservesPrefix = true;
+  return { unknown: promptTokens === null, estimated: true, lossTokens, lossRatio,
+    previousPromptTokens: promptTokens, commonPrefixChars: routeChanged ? 0 : proof.chars,
+    previousChars: proof.chars, changes, previousFingerprint: proof.fingerprint, fingerprint: current.fingerprint,
+    ...(promptTokens === null ? { message: '上次回执没有完整输入用量，无法可靠估计损失 Token' } : {}) };
+}
 
 // Retained diagnostics must not turn a projection exception into a prompt copy.
 function diagnostic(value) {
@@ -160,24 +229,46 @@ function* iterateFacts(records, config) {
   const sessionId = splitRecords(records).header?.id ?? config.sessionId;
   const inherited = seq => accounting.ownership.known ? seq < accounting.ownership.inheritedEventCount : null;
   const calls = [];
+  const reusable = config.reuseFacts?.analyzerVersion === ANALYZER_VERSION ? config.reuseFacts.calls : [];
+  const oldCalls = new Map(reusable.map(call => [call.seq, call]));
+  const skipCallBeforeSeq = reusable.length ? reusable.at(-1).seq + 1 : -1;
   const receiptSeqs = [];
   let previous;
   let compactionIndex = 0;
   let lastCompactionSeq = -1;
-  for (const checkpoint of iterateCallSteps(records, config)) {
+  for (const checkpoint of iterateCallSteps(records, { ...config, skipCallBeforeSeq })) {
     if (!checkpoint?.call) { yield null; continue; }
     const call = checkpoint.call;
     while (accounting.compactionSeqs[compactionIndex] < call.seq) {
       lastCompactionSeq = accounting.compactionSeqs[compactionIndex++];
       yield null;
     }
+    const old = oldCalls.get(call.seq);
+    if (old) {
+      calls.push({ ...old, baseline: selectReceiptBaseline(records, { ...config, receiptSeqs }) });
+      if (call.settlement === 'assistant/message' || call.usage.reported) {
+        previous = { call, proof: old.inputProof };
+        receiptSeqs.push(call.seq);
+      }
+      config.onReuseCall?.({ seq: call.seq });
+      yield null;
+      continue;
+    }
     config.onNormalize?.({ seq: call.seq });
     const currentInput = normalizeRequest(call.request, config.historicalCapabilities ?? {});
     let comparison;
     if (previous) {
-      const { significant, ...neutral } = compareRequests(previous.input, currentInput, {
+      let input = previous.input;
+      let neutral = input ? null : compareProof(previous.proof, currentInput, previous.call.usage.promptTokens);
+      if (!input && !neutral) {
+        config.onNormalize?.({ seq: previous.call.seq, reason: 'prefix-proof-mismatch' });
+        config.onCacheMiss?.({ reason: 'prefix-proof-mismatch', seq: previous.call.seq });
+        const rebuilt = reconstructCall(records, previous.call.seq, config);
+        input = normalizeRequest(rebuilt?.request, config.historicalCapabilities ?? {});
+      }
+      if (!neutral) { const { significant, ...value } = compareRequests(input, currentInput, {
         previousPromptTokens: previous.call.usage.promptTokens,
-      });
+      }); neutral = value; }
       comparison = { ...neutral, changes: retainedChanges(neutral.changes),
         ...(neutral.message ? { message: diagnostic(neutral.message) } : {}) };
     }
@@ -185,10 +276,11 @@ function* iterateFacts(records, config) {
       turn: call.turn, step: call.step, seq: call.seq, at: call.at,
       provider: call.provider, model: call.model, inherited: inherited(call.seq),
       settlement: call.settlement, usage: call.usage,
+      inputProof: inputProof(currentInput),
       baseline: selectReceiptBaseline(records, { ...config, receiptSeqs }),
       previousPromptTokens: previous?.call.usage.promptTokens ?? null,
       comparison: comparison ?? null,
-      comparisonUnknown: previous ? !currentInput.comparable || !previous.input.comparable : false,
+      comparisonUnknown: previous ? !currentInput.comparable || (previous.input ? !previous.input.comparable : !previous.proof?.comparable) : false,
       expectedRebuild: Boolean(previous && lastCompactionSeq > previous.call.seq),
       ...(call.unknown || currentInput.unknown ? { unknown: diagnostic(call.unknown ?? currentInput.unknown) } : {}),
     });
