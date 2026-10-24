@@ -222,6 +222,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await page.getByText('末次缓存 99K tok · 99%', { exact: true }).waitFor();
     assert.deepEqual(await page.evaluate(() => __registrations.map(item => ({ name: item.meta.name, order: item.meta.order }))), [
       { name: 'conversation.composer.dock', order: 1.5 }, { name: 'conversation.input.dock', order: 10 }, { name: 'conversation.chat.turnTail', order: 100 }, { name: 'settings.section', order: 200 },
+      { name: 'sidebar.footer.action', order: 150 },
     ]);
     assert.deepEqual(await page.evaluate(() => ({ id: __registrations[3].meta.id, label: __registrations[3].meta.label })), { id: 'dsh-cache-helper', label: '缓存看板' });
     const tail = turnNumber => page.locator(`[data-turn-tail="${turnNumber}"]`);

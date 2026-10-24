@@ -44,6 +44,11 @@ window.__ModuleLoader__.load({
     let locks = 0;
     let previousOverflow = '';
     const number = new Intl.NumberFormat('zh-CN');
+    const pendingListeners = new Set();
+    let pendingSnapshot = { pending: [], observations: [], stops: [], loading: true, error: null };
+    let pendingTimer = null;
+    let pendingFlight = null;
+    let pendingGeneration = 0;
 
     const finite = value => typeof value === 'number' && Number.isFinite(value);
     const reliableSeq = value => Number.isSafeInteger(value) && value >= 0;
@@ -149,6 +154,45 @@ window.__ModuleLoader__.load({
       useEffect(() => sessionId ? subscribe(sessionId, setState) : undefined, [sessionId]);
       return sessionId ? (state && state.sessionId === sessionId ? state : recordFor(sessionId).snapshot) : null;
     }
+    async function refreshPending() {
+      if (pendingFlight) return pendingFlight.promise;
+      const controller = new AbortController();
+      const generation = ++pendingGeneration;
+      const promise = (async () => {
+        try {
+          const data = await request('/pending', { signal: controller.signal });
+          if (generation !== pendingGeneration) return;
+          pendingSnapshot = { ...data, pending: Array.isArray(data?.pending) ? data.pending : [],
+            observations: Array.isArray(data?.observations) ? data.observations : [],
+            stops: Array.isArray(data?.stops) ? data.stops : [], loading: false, error: null };
+        } catch (error) {
+          if (controller.signal.aborted || generation !== pendingGeneration) return;
+          pendingSnapshot = { ...pendingSnapshot, loading: false, error: error.message || '确认队列连接中断' };
+        } finally {
+          if (generation === pendingGeneration) {
+            pendingFlight = null;
+            pendingListeners.forEach(listener => listener());
+          }
+        }
+      })();
+      pendingFlight = { controller, promise };
+      return promise;
+    }
+    function subscribePending(listener) {
+      pendingListeners.add(listener);
+      if (!pendingTimer) {
+        void refreshPending();
+        pendingTimer = setInterval(() => { void refreshPending(); }, POLL_MS);
+      }
+      return () => {
+        pendingListeners.delete(listener);
+        if (pendingListeners.size) return;
+        clearInterval(pendingTimer); pendingTimer = null;
+        pendingFlight?.controller.abort(); pendingFlight = null; pendingGeneration++;
+      };
+    }
+    const getPendingSnapshot = () => pendingSnapshot;
+    function usePending() { return useSyncExternalStore(subscribePending, getPendingSnapshot, getPendingSnapshot); }
     function Icon({ name = 'cache', size = 14 }) {
       const paths = name === 'close' ? ['M4 4l12 12M16 4L4 16']
         : name === 'warning' ? ['M10 2 1 18h18L10 2Z', 'M10 7v5M10 15v.1']
@@ -165,7 +209,7 @@ window.__ModuleLoader__.load({
         Array.isArray(change.removed) && change.removed.length ? h('span', { className: 'dch-dim' }, `；移除：${change.removed.join('、')}`) : null,
       ))) : h('p', { className: 'dch-dim' }, empty);
     }
-    function Modal({ title, subtitle, children, onClose, className = '', busy = false, alert = false }) {
+    function Modal({ title, subtitle, children, onClose, className = '', busy = false, alert = false, closeLabel }) {
       const panel = useRef(null);
       const token = useRef({});
       const close = useRef(onClose);
@@ -207,7 +251,7 @@ window.__ModuleLoader__.load({
         onMouseDown: event => { if (event.target === event.currentTarget) close.current(); },
       }, h('section', { ref: panel, role: alert ? 'alertdialog' : 'dialog', 'aria-modal': true, 'aria-label': title, tabIndex: -1, className: `dch-modal ${className}`, 'aria-busy': busy },
         h('header', { className: 'dch-modal-header' }, h('div', null, h('h2', null, title), subtitle ? h('p', { className: 'dch-subtitle' }, subtitle) : null),
-          h(Button, { className: 'dch-icon-button', onClick: onClose, disabled: busy, 'aria-label': alert ? '取消发送并关闭警告' : title === '生成精简副本' ? '关闭精简副本结果' : '关闭缓存看板', title: alert ? '取消发送' : '关闭' }, h(Icon, { name: 'close', size: 18 }))), children)), document.body);
+          h(Button, { className: 'dch-icon-button', onClick: onClose, disabled: busy, 'aria-label': closeLabel ?? (alert ? '取消发送并关闭警告' : title === '生成精简副本' ? '关闭精简副本结果' : '关闭缓存看板'), title: alert ? '取消发送' : '关闭' }, h(Icon, { name: 'close', size: 18 }))), children)), document.body);
     }
     function Gate({ sessionId, pending, onDone, connectionError, onCompact }) {
       const [busy, setBusy] = useState(false);
@@ -245,6 +289,108 @@ window.__ModuleLoader__.load({
           h(Button, { onClick: () => { void decide('cancel'); }, disabled: busy, 'data-dch-autofocus': true }, busy ? '正在处理…' : '取消本次发送'),
           h(Button, { onClick: onCompact, disabled: busy || Boolean(connectionError) }, '生成精简副本'),
           h(Button, { className: 'dch-button-primary', disabled: busy || Boolean(connectionError), onClick: () => { void decide('confirm'); } }, '确认并发送')));
+    }
+    const baselineLabel = value => ({ own: '自身最近回执', inherited: '继承前缀', none: '首次请求', unknown: '基线未知' })[typeof value === 'string' ? value : value?.kind] || '基线未知';
+    function PendingList({ items, connectionError, onView }) {
+      const [actions, setActions] = useState({});
+      const alive = useRef(true);
+      const busy = useRef(new Set());
+      useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+      useEffect(() => {
+        const keys = new Set(items.map(item => identity(item.sessionId, item)));
+        setActions(previous => Object.keys(previous).some(key => !keys.has(key))
+          ? Object.fromEntries(Object.entries(previous).filter(([key]) => keys.has(key))) : previous);
+      }, [items]);
+      async function act(item, action) {
+        const key = identity(item.sessionId, item);
+        if (busy.current.has(key)) return;
+        busy.current.add(key);
+        setActions(previous => ({ ...previous, [key]: { busy: true } }));
+        try {
+          const payload = action === 'stop' ? { sessionId: item.sessionId,
+            parentSessionId: item.directParentId ?? item.parentSessionId ?? item.identity?.directParentId,
+            activationGeneration: item.activationGeneration ?? item.identity?.activationGeneration,
+            id: item.id, fingerprint: item.fingerprint }
+            : { sessionId: item.sessionId, id: item.id, fingerprint: item.fingerprint, decision: action };
+          const result = await request(action === 'stop' ? '/children/stop' : '/decision', {
+            method: 'POST', body: JSON.stringify(payload),
+          });
+          if (alive.current) setActions(previous => ({ ...previous, [key]: { done: true,
+            message: action === 'stop' ? ({ stopped: '已确认此子任务静止', idle: '已确认此子任务静止',
+              'stop-unconfirmed': '停止信号已接纳，尚未确认静止', superseded: '目标已有新输入，请查看当前子任务' })[result?.state] || '停止信号已接纳，未确认静止'
+              : action === 'confirm' ? '已批准这一条请求' : '已取消这一条请求' } }));
+          void refreshPending(); void refresh(item.sessionId);
+        } catch (error) {
+          if (alive.current) setActions(previous => ({ ...previous, [key]: { error: error.message || '操作未完成' } }));
+        } finally { busy.current.delete(key); }
+      }
+      return h('div', { className: 'dch-pending-list', 'aria-label': '待确认请求列表' },
+        ...items.map(item => {
+          const key = identity(item.sessionId, item);
+          const action = actions[key];
+          const child = item.role === 'sub' || item.identity?.role === 'sub' || Boolean(item.activationGeneration);
+          return h('article', { key, className: 'dch-pending-item', 'aria-label': `${child ? '子任务' : '会话'} ${item.sessionId} 等待缓存确认` },
+            h('strong', null, `${child ? '子任务' : '会话'} ${item.sessionId}`),
+            h('p', { className: 'dch-note' }, `${baselineLabel(item.baseline ?? item.baselineKind)} · ${stepLabel(item)}${item.createdAt ? ` · 等待自 ${time(item.createdAt)}` : ''}`),
+            h('p', null, item.unknown ? '本次旧前缀无法可靠检查' : `预计 ${short(item.lossTokens)} tok 旧前缀失去复用条件`),
+            item.expiresAt ? h('p', { className: 'dch-note' }, `截止 ${time(item.expiresAt)}，到期取消；重连不会延长。`) : null,
+            h(Changes, { changes: changesOf(item) }),
+            h('p', { className: 'dch-note' }, '发送前估计；实际命中仍以用量回执为准。'),
+            action?.error ? h('p', { className: 'dch-error', role: 'alert' }, action.error) : null,
+            action?.done ? h('p', { role: 'status' }, action.message) : h('div', { className: 'dch-policy-actions' },
+              h(Button, { disabled: action?.busy, onClick: () => { void act(item, 'cancel'); } }, '取消本次发送'),
+              h(Button, { className: 'dch-button-primary', disabled: action?.busy || Boolean(connectionError), onClick: () => { void act(item, 'confirm'); } }, '继续本次发送'),
+              child ? h(Button, { disabled: action?.busy || Boolean(connectionError), onClick: () => { void act(item, 'stop'); } }, action?.busy ? '正在处理…' : '停止此子任务') : null),
+            child ? h('p', { className: 'dch-note' }, '停止只针对这个子任务，不会自动停止它启动的子任务。') : null,
+            onView ? h(Button, { onClick: () => onView(item.sessionId) }, '查看此会话') : null);
+        }));
+    }
+    function GlobalPending({ wide = true }) {
+      const state = usePending();
+      const button = useRef(null);
+      const [open, setOpen] = useState(false);
+      useEffect(() => {
+        const channelId = `cache-confirm-${window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
+        let sequence = 0;
+        const beat = reachable => {
+          void request('/pending/reachable', { method: 'POST', body: JSON.stringify({ channelId, seq: ++sequence, reachable }) }).catch(() => {});
+        };
+        const update = () => {
+          let node = button.current;
+          let reachable = document.visibilityState !== 'hidden' && Boolean(node?.isConnected && node.getClientRects().length);
+          for (let hops = 0; reachable && node && hops < 64; hops++, node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility) || style.opacity === '0') reachable = false;
+          }
+          beat(reachable);
+        };
+        update(); const timer = setInterval(update, 4000);
+        document.addEventListener('visibilitychange', update);
+        window.addEventListener('resize', update);
+        return () => { clearInterval(timer); document.removeEventListener('visibilitychange', update); window.removeEventListener('resize', update); beat(false); };
+      }, []);
+      const count = state.pending.length;
+      return h(React.Fragment, null,
+        h('button', { ref: button, type: 'button', className: `dch-button dch-global-confirm${wide ? '' : ' dch-confirm-rail'}`,
+          'aria-label': `缓存待确认 ${count} 项`, title: `缓存待确认 ${count} 项`, onClick: () => { setOpen(true); void refreshPending(); } },
+        h(Icon, { name: count ? 'warning' : 'cache' }), wide ? `缓存确认${count ? ` (${count})` : ''}` : count ? h('span', { className: 'dch-confirm-count', 'aria-hidden': true }, count) : null),
+        open ? h(Modal, { title: '缓存待确认', subtitle: '主会话和子任务共享这一份队列', closeLabel: '关闭缓存确认列表', onClose: () => setOpen(false) },
+          h('div', { className: 'dch-modal-body' },
+            state.error ? h('p', { className: 'dch-error', role: 'alert' }, `${state.error}。连接恢复前无法批准请求。`) : null,
+            h('p', { className: 'dch-note' }, `子任务保护：${state.childProtection === 'block' ? '阻断并等待确认' : '观察，仅记录风险'}。`),
+            count ? h(PendingList, { items: state.pending, connectionError: state.error }) : h('p', { className: 'dch-empty' }, state.loading ? '正在读取确认队列…' : '当前没有等待确认的请求'),
+            h(StopOutcomes, { items: state.stops }),
+            state.observations.length ? h('details', null, h('summary', null, `最近观察到 ${state.observations.length} 项风险`),
+              ...state.observations.map((item, index) => h('p', { key: item.id || index, className: 'dch-note' }, `${item.sessionId || '子任务'} · ${baselineLabel(item.baseline ?? item.baselineKind)} · ${item.reason || '仅观察，未暂停此请求'}`))) : null)) : null);
+    }
+    function StopOutcomes({ items }) {
+      if (!items?.length) return null;
+      return h('section', { className: 'dch-stop-outcomes', 'aria-label': '子任务停止记录' },
+        h('h3', null, '子任务停止记录'), ...items.map(item => h('div', { className: 'dch-pending-item', key: `${item.sessionId}:${item.activationGeneration}:${item.startedAt}` },
+          h('strong', null, item.sessionId), h('p', { role: 'status' }, ({ stopping: '停止信号已接纳，正在观察此子任务',
+            stopped: '已确认此子任务静止', 'stop-unconfirmed': '停止信号已接纳，尚未确认静止',
+            superseded: '目标已有新输入或新 activation，旧停止观察已失效' })[item.state] || '停止状态未知'),
+          h('p', { className: 'dch-note' }, '此操作没有停止它启动的子任务。'))));
     }
     function TurnCacheReading({ sessionId, turn: turnOwner, seq }) {
       // The native turnTail owner is a TurnLocation. Keep the primitive form
@@ -389,6 +535,7 @@ window.__ModuleLoader__.load({
     }
     function CacheGate({ sessionId }) {
       const state = useSession(sessionId);
+      const queue = usePending();
       const [finished, setFinished] = useState('');
       const [compacting, setCompacting] = useState(false);
       useEffect(() => { setCompacting(false); }, [sessionId]);
@@ -396,7 +543,14 @@ window.__ModuleLoader__.load({
       const data = state && state.data;
       const pending = data && data.pending;
       const pendingKey = identity(sessionId, pending);
-      return h(React.Fragment, null, !compacting && pending && pendingKey !== finished ? h(Gate, { key: pendingKey, sessionId, pending, onDone: setFinished, connectionError: state?.error, onCompact: () => { setCompacting(true); } }) : null, compacting ? h(CompactionDialog, { key: sessionId, sessionId, onClose: () => { setCompacting(false); void refresh(sessionId); } }) : null);
+      const children = queue.pending.filter(item => item.sessionId === sessionId && (item.role === 'sub' || item.identity?.role === 'sub')
+        || (item.directParentId ?? item.parentSessionId ?? item.identity?.directParentId) === sessionId);
+      const stops = queue.stops.filter(item => item.sessionId === sessionId || item.parentSessionId === sessionId);
+      const ownMain = pending && pending.role !== 'sub' && pending.identity?.role !== 'sub';
+      return h(React.Fragment, null,
+        children.length || stops.length ? h('details', { className: 'dch-parent-pending', open: true }, h('summary', null, `${children.length} 个子任务请求等待缓存确认${stops.length ? ` · ${stops.length} 条停止记录` : ''}`), h(PendingList, { items: children, connectionError: queue.error }), h(StopOutcomes, { items: stops })) : null,
+        !compacting && ownMain && pendingKey !== finished ? h(Gate, { key: pendingKey, sessionId, pending, onDone: setFinished, connectionError: state?.error, onCompact: () => { setCompacting(true); } }) : null,
+        compacting ? h(CompactionDialog, { key: sessionId, sessionId, onClose: () => { setCompacting(false); void refresh(sessionId); } }) : null);
     }
     function WarnStrip({ sessionId }) {
       const state = useSession(sessionId);
@@ -530,6 +684,195 @@ window.__ModuleLoader__.load({
           })) : h('p', { className: 'dch-chart-empty' }, '所选范围暂无模型记录')),
         h('p', { className: 'dch-note' }, '图表仅覆盖所选范围内已记录的调用；日期或模型未知会单列，次数未知不参与占比。'));
     }
+    const jobActive = job => job && ['queued', 'running'].includes(job.state);
+    const jobStateLabel = value => ({ queued: '排队', running: '分析中', completed: '完成', cached: '复用缓存',
+      failed: '失败', limited: '超过预算', cancelled: '已取消', interrupted: '进程中断，未自动续跑' })[value] || value;
+    function SessionAnalysisSelector({ onView, active }) {
+      const [open, setOpen] = useState(false);
+      const [filters, setFilters] = useState({ q: '', role: 'all', availability: 'all', analysis: 'all', createdFrom: '', createdTo: '', activityFrom: '', activityTo: '' });
+      const [directory, setDirectory] = useState(null);
+      const [cursors, setCursors] = useState(['']);
+      const [page, setPage] = useState(0);
+      const [chosen, setChosen] = useState(new Map());
+      const [includeChildren, setIncludeChildren] = useState(false);
+      const [preview, setPreview] = useState(null);
+      const [job, setJob] = useState(null);
+      const [jobs, setJobs] = useState([]);
+      const [loading, setLoading] = useState(false);
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState('');
+      const alive = useRef(true);
+      const flight = useRef(null);
+      const generation = useRef(0);
+      const key = useRef(null);
+      function rememberJob(next) {
+        setJob(next);
+        setJobs(previous => [next, ...previous.filter(item => item.id !== next.id)].sort((a, b) => b.updatedAt - a.updatedAt));
+      }
+      async function loadJobs(signal) {
+        const result = await request('/analysis/jobs', { signal });
+        if (!alive.current || signal?.aborted) return;
+        const values = (Array.isArray(result) ? result : result?.jobs || []).slice().sort((a, b) => b.updatedAt - a.updatedAt);
+        setJobs(values);
+        setJob(previous => values.find(item => item.id === previous?.id) || values[0] || previous || null);
+      }
+      useEffect(() => { alive.current = true; return () => { alive.current = false; flight.current?.abort(); generation.current++; }; }, []);
+      async function loadDirectory(cursor = '', nextPage = 0, reset = false) {
+        flight.current?.abort(); const controller = new AbortController(); flight.current = controller;
+        const current = ++generation.current;
+        setLoading(true); setError('');
+        try {
+          const query = new URLSearchParams({ limit: '25', role: filters.role, availability: filters.availability, analysis: filters.analysis });
+          if (cursor) query.set('cursor', cursor);
+          if (filters.q.trim()) query.set('q', filters.q.trim());
+          for (const field of ['createdFrom', 'createdTo', 'activityFrom', 'activityTo']) {
+            if (!filters[field]) continue;
+            const value = Date.parse(filters[field]);
+            if (!finite(value)) throw new Error('请输入有效日期');
+            query.set(field, String(value));
+          }
+          const data = await request(`/sessions?${query}`, { signal: controller.signal });
+          if (!alive.current || generation.current !== current) return;
+          setDirectory(data); setPage(nextPage);
+          if (reset) { setCursors(['']); setChosen(new Map()); setPreview(null); }
+        } catch (cause) { if (!controller.signal.aborted && alive.current && generation.current === current) setError(cause.message || '目录读取失败'); }
+        finally { if (alive.current && generation.current === current) setLoading(false); }
+      }
+      useEffect(() => {
+        if (!open) return;
+        void loadDirectory();
+        const controller = new AbortController();
+        void loadJobs(controller.signal).catch(() => {});
+        return () => { controller.abort(); flight.current?.abort(); };
+      }, [open]);
+      useEffect(() => {
+        if (!open || !active || !jobActive(job)) return;
+        const controller = new AbortController();
+        let polling = false;
+        const poll = async () => {
+          if (polling) return; polling = true;
+          try {
+            const next = await request(`/analysis/jobs?id=${encodeURIComponent(job.id)}`, { signal: controller.signal });
+            if (!controller.signal.aborted && alive.current) rememberJob(next);
+          } catch (cause) { if (!controller.signal.aborted && alive.current) setError(`进度连接中断：${cause.message}。任务仍可在重连后查询。`); }
+          finally { polling = false; }
+        };
+        const timer = setInterval(() => { void poll(); }, POLL_MS); void poll();
+        return () => { clearInterval(timer); controller.abort(); };
+      }, [open, active, job?.id, job?.state]);
+      function changeSelection(row, selected, only = false) {
+        setChosen(previous => { const next = only ? new Map() : new Map(previous); selected ? next.set(row.sessionId, row) : next.delete(row.sessionId); return next; });
+        setPreview(null); key.current = null;
+      }
+      async function prepare(ids = [...chosen.keys()], withChildren = includeChildren) {
+        if (!ids.length || busy) return;
+        setBusy(true); setError('');
+        try {
+          const result = await request('/analysis/selection', { method: 'POST', body: JSON.stringify({
+            sessionIds: ids, includeChildren: withChildren, ...(directory?.snapshotId ? { snapshotId: directory.snapshotId } : {}),
+          }) });
+          if (alive.current) { setPreview(result); key.current = null; }
+        } catch (cause) { if (alive.current) setError(cause.message || '选择范围无法确认'); }
+        finally { if (alive.current) setBusy(false); }
+      }
+      async function start(mode) {
+        if (busy || jobActive(job) || !preview?.selectedIds?.length) return;
+        setBusy(true); setError('');
+        // Retain this key after an uncertain transport outcome. A retry of the
+        // same reviewed selection must not create a second background task.
+        key.current ||= window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        try {
+          const next = await request('/analysis/jobs', { method: 'POST', body: JSON.stringify({
+            sessionIds: preview.selectedIds, includeChildren: false, mode, idempotencyKey: `${key.current}:${mode}`,
+            snapshotId: preview.snapshotId,
+          }) });
+          if (alive.current) rememberJob(next);
+        } catch (cause) { if (alive.current) setError(`${cause.message || '启动结果未知'}。可以重试；相同选择会沿用任务标识。`); }
+        finally { if (alive.current) setBusy(false); }
+      }
+      async function cancel() {
+        if (!jobActive(job) || busy) return;
+        setBusy(true); setError('');
+        try {
+          const next = await request('/analysis/jobs/cancel', { method: 'POST', body: JSON.stringify({ id: job.id }) });
+          if (alive.current) rememberJob(next);
+        } catch (cause) { if (alive.current) setError(cause.message || '取消尚未确认'); }
+        finally { if (alive.current) setBusy(false); }
+      }
+      return h('section', { className: 'dch-analysis-selector', 'aria-label': '选择会话分析' },
+        h(Button, { onClick: () => setOpen(previous => !previous), 'aria-expanded': open }, open ? '收起会话选择' : '选择会话分析'),
+        open ? h('div', { className: 'dch-analysis-body' },
+          h('p', { className: 'dch-note' }, '只做本地分析，不唤醒 Agent、不发送消息、不调用模型。应用筛选会清除当前选择。'),
+          h('form', { className: 'dch-catalog-filters', onSubmit: event => { event.preventDefault(); void loadDirectory('', 0, true); } },
+            h('label', null, '标题、ID 或目录', h('input', { type: 'search', value: filters.q, 'aria-label': '筛选历史会话', onChange: event => setFilters(previous => ({ ...previous, q: event.target.value })) })),
+            ...[['role', '会话类型', [['all', '全部类型'], ['main', '主 Agent'], ['sub', '子 Agent'], ['fork', '人工分支']]],
+              ['availability', '运行状态', [['all', '全部状态'], ['live', '已在内存'], ['history', '历史会话']]],
+              ['analysis', '分析状态', [['all', '全部分析状态'], ['cached', '已分析'], ['stale', '需更新'], ['none', '未分析']]]].map(([field, label, choices]) =>
+              h('label', { key: field }, label, h('select', { value: filters[field], 'aria-label': label, onChange: event => setFilters(previous => ({ ...previous, [field]: event.target.value })) },
+                ...choices.map(([value, title]) => h('option', { value, key: value }, title))))),
+            ...[['createdFrom', '创建时间起'], ['createdTo', '创建时间止'], ['activityFrom', '活跃时间起'], ['activityTo', '活跃时间止']].map(([field, label]) => h('label', { key: field }, label,
+              h('input', { type: 'datetime-local', value: filters[field], 'aria-label': label, onChange: event => setFilters(previous => ({ ...previous, [field]: event.target.value })) }))),
+            h(Button, { type: 'submit', disabled: loading }, loading ? '读取目录中…' : '筛选目录')),
+          error ? h('p', { className: 'dch-error', role: 'alert' }, error) : null,
+          h('p', { className: 'dch-note' }, `${directory?.total ?? 0} 个匹配会话${directory?.coverage?.limited ? '，目录达到保留上限' : ''}；只列元数据，未分析项的模型和异常仍未知。`),
+          h('div', { className: 'dch-catalog-list', 'aria-label': '历史会话目录' }, ...(directory?.items || []).map(row => h('div', { key: row.sessionId, className: 'dch-catalog-row' },
+            h('label', { className: 'dch-check' }, h('input', { type: 'checkbox', checked: chosen.has(row.sessionId), 'aria-label': `选择 ${row.title || row.sessionId}`,
+              onChange: event => changeSelection(row, event.target.checked) }), h('strong', null, row.title || row.sessionId)),
+            h('small', { className: 'dch-session-id' }, row.sessionId),
+            h('span', { className: 'dch-note' }, `${({ main: '主 Agent', sub: '子 Agent', fork: '人工分支' })[row.kind] || '会话'} · ${row.live ? '已在内存' : '历史'} · ${({ cached: '已分析', stale: '需更新', none: '未分析' })[row.analysisStatus] || '分析状态未知'}`),
+            h('small', { className: 'dch-dim' }, `创建 ${time(row.createdAt)} · 活跃 ${time(row.activityAt)}${row.activitySource === 'created-fallback' ? '（按创建时间回退）' : row.activitySource === 'unknown' ? '（未知）' : ''}`),
+            h('small', { className: 'dch-dim' }, row.budgetKnown ? `${short(row.eventCount)} 个事件 · ${short(row.sizeBytes)} bytes` : '读取预算元数据不完整，将采用保守批次'),
+            h(Button, { onClick: () => changeSelection(row, true, true) }, '仅选此会话')))),
+          h('div', { className: 'dch-pagination' },
+            h(Button, { disabled: loading || page === 0, onClick: () => { void loadDirectory(cursors[page - 1], page - 1); } }, '上一页会话'),
+            h('span', null, `第 ${page + 1} 页`),
+            h(Button, { disabled: loading || !directory?.nextCursor, onClick: () => {
+              const next = directory.nextCursor; setCursors(previous => [...previous.slice(0, page + 1), next]); void loadDirectory(next, page + 1);
+            } }, '下一页会话')),
+          h('div', { className: 'dch-policy-actions' },
+            h('label', { className: 'dch-check' }, h('input', { type: 'checkbox', checked: includeChildren, onChange: event => { setIncludeChildren(event.target.checked); setPreview(null); key.current = null; } }), '包含子 Agent'),
+            h('span', { className: 'dch-note' }, `已选择 ${chosen.size} 个会话；人工分支不会自动并入子树。`),
+            h(Button, { disabled: busy || !chosen.size, onClick: () => { void prepare(); } }, '预览分析范围')),
+          preview ? h('div', { className: 'dch-analysis-selection', role: 'status' },
+            h('p', null, `固定分析范围：${preview.selectedIds?.length || 0} 个会话（已去重）`),
+            h('details', null, h('summary', null, '查看所选会话 ID'), h('ul', null, ...(preview.selectedIds || []).map(id => h('li', { key: id, className: 'dch-session-id' }, id)))),
+            h('div', { className: 'dch-policy-actions' },
+              h(Button, { disabled: busy || jobActive(job), className: 'dch-button-primary', onClick: () => { void start('reuse'); } }, '分析所选'),
+              h(Button, { disabled: busy || jobActive(job), onClick: () => { void start('refresh'); } }, '重新分析')),
+            h('p', { className: 'dch-note' }, '分析所选会复用有效缓存；重新分析会跳过结果缓存。')) : null,
+          jobs.length ? h('div', { className: 'dch-policy-actions' },
+            h('label', null, '分析任务', h('select', { value: job?.id || '', 'aria-label': '选择分析任务', onChange: event => setJob(jobs.find(item => item.id === event.target.value)) },
+              ...jobs.map(item => h('option', { key: item.id, value: item.id }, `${time(item.createdAt)} · ${jobStateLabel(item.state)} · ${item.progress?.total ?? item.items?.length ?? 0} 个会话`)))),
+            h(Button, { onClick: () => { void loadJobs().catch(cause => { if (alive.current) setError(cause.message); }); } }, '刷新分析任务')) : null,
+          job ? h('section', { className: 'dch-analysis-progress', 'aria-label': '本地分析进度' },
+            h('h3', null, `分析任务：${jobStateLabel(job.state)}`),
+            h('p', { role: 'status' }, `${job.progress?.finished || 0} / ${job.progress?.total ?? job.items?.length ?? 0} 已结束 · ${job.progress?.failed || 0} 失败 · ${job.progress?.limited || 0} 超限`),
+            h('p', { className: 'dch-note' }, '取消分析只取消这个分析任务；已完成结果保留，不停止 Agent 或回答发送确认。'),
+            h('p', { className: 'dch-note' }, '结果按固定切点计算；未知用量和辅助调用覆盖缺口请查看分析明细。'),
+            jobActive(job) ? h(Button, { disabled: busy, onClick: () => { void cancel(); } }, '取消分析') : null,
+            h('div', { className: 'dch-analysis-results' }, ...(job.items || []).map(item => h('div', { key: item.sessionId, className: 'dch-analysis-result' },
+              h('span', { className: 'dch-session-id' }, item.sessionId), h('strong', null, jobStateLabel(item.state)),
+              item.error ? h('span', { className: 'dch-error' }, item.error.message) : null,
+              reliableSeq(item.sourceCut?.lastSeq) ? h('small', { className: 'dch-dim' }, `分析至事件 ${item.sourceCut.lastSeq}`) : null,
+              item.coverage?.unknown || item.coverage?.partial || item.coverage?.unknownCalls > 0 ? h('small', { className: 'dch-dim' }, `覆盖不完整${item.coverage?.unknownCalls > 0 ? ` · ${item.coverage.unknownCalls} 个调用重建未知` : ''}`) : null,
+              ['cached', 'completed'].includes(item.state) ? h(Button, { onClick: () => onView(item.sessionId, item.sourceCut) }, '查看分析结果') : null))),
+            !jobActive(job) && job.items?.some(item => !['cached', 'completed'].includes(item.state)) ? h(Button, { disabled: busy, onClick: () => {
+              const ids = job.items.filter(item => !['cached', 'completed'].includes(item.state)).map(item => item.sessionId);
+              setChosen(new Map(ids.map(id => [id, { sessionId: id }]))); setIncludeChildren(false); setPreview(null); key.current = null;
+            } }, '选择未完成项重试') : null) : null) : null);
+    }
+    function AnalysisEvidence({ detail, error, reference }) {
+      if (!detail?.sourceCut && !error) return null;
+      const unverified = detail?.sourceCut?.validation === 'unverified' || detail?.stale || String(detail?.cacheStatus || '').includes('stale');
+      return h('div', { className: 'dch-analysis-evidence' },
+        h('p', { className: 'dch-note', role: 'status' }, `${unverified ? '缓存结果，尚未校验当前日志' : '本地分析结果'}${reliableSeq(detail?.sourceCut?.lastSeq) ? ` · 分析至事件 ${detail.sourceCut.lastSeq}` : ''}${detail?.hasNewEvents ? ' · 有新事件，需更新分析' : ''}`),
+        error ? h('p', { className: 'dch-error', role: 'alert' }, `${error}。显示上次结果。`) : null,
+        reliableSeq(reference?.lastSeq) && reference.lastSeq !== detail?.sourceCut?.lastSeq ? h('p', { className: 'dch-note' }, `所选分析任务的水位为事件 ${reference.lastSeq}；当前明细展示另一次分析结果。`) : null,
+        detail?.coverage?.unknownCalls ? h('p', { className: 'dch-note' }, `${detail.coverage.unknownCalls} 个调用的输入重建不完整，未补为零。`) : null,
+        detail?.accountingSummary ? h('div', { className: 'dch-note', role: 'status' },
+          h('p', null, `已保留用量汇总：自身 ${exact(detail.accountingSummary.own?.calls)} 次调用，已知缓存读取 ${short(detail.accountingSummary.own?.knownCacheReadTokens)} tok。`),
+          h('p', null, `未知用量 ${exact(detail.accountingSummary.own?.unknownUsageCalls)} 次；继承 ${exact(detail.accountingSummary.inherited?.calls)} 次单列。日期、模型、步骤与异常明细未覆盖，空步骤不表示无异常。`)) : null);
+    }
     function Dashboard({ initialSessionId, onClose, inline = false }) {
       const dashboardId = useId();
       const [activeTab, setActiveTab] = useState(initialSessionId ? 'sessions' : 'overview');
@@ -546,6 +889,8 @@ window.__ModuleLoader__.load({
       const [detail, setDetail] = useState(null);
       const [detailError, setDetailError] = useState(null);
       const [detailLoading, setDetailLoading] = useState(true);
+      const [detailVersion, setDetailVersion] = useState(0);
+      const [resultReference, setResultReference] = useState(null);
       const onlyWarnings = useOnlyWarningsFilter();
       const [page, setPage] = useState(0);
       const revision = useRef(0);
@@ -575,14 +920,22 @@ window.__ModuleLoader__.load({
         const controller = new AbortController();
         setDetail(null); setDetailError(null); setDetailLoading(true); setPage(0);
         if (!selected) { setDetailLoading(false); return () => { controller.abort(); }; }
-        request(`/session?sessionId=${encodeURIComponent(selected)}`, { signal: controller.signal }).then(next => {
+        (async () => {
+          const path = `/session?sessionId=${encodeURIComponent(selected)}`;
+          const cached = await request(`${path}&cached=1`, { signal: controller.signal }).catch(error => {
+            if (controller.signal.aborted) throw error;
+            return null;
+          });
+          if (cached?.sessionId === selected && alive.current && detailRevision.current === current) { setDetail(cached); setDetailLoading(false); }
+          const unverified = cached?.sourceCut?.validation === 'unverified' || cached?.stale || String(cached?.cacheStatus || '').includes('stale');
+          const next = cached && !unverified ? cached : await request(path, { signal: controller.signal });
           if (next?.sessionId !== selected) throw new Error('会话数据不匹配，已忽略本次响应');
           if (alive.current && detailRevision.current === current) setDetail(next);
-        }).catch(cause => {
+        })().catch(cause => {
           if (!controller.signal.aborted && alive.current && detailRevision.current === current) setDetailError(cause.message || '会话读取失败');
         }).finally(() => { if (alive.current && detailRevision.current === current) setDetailLoading(false); });
         return () => { controller.abort(); };
-      }, [selected, data]);
+      }, [selected, data, detailVersion]);
       const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
       const search = query.trim().toLowerCase();
       const shown = sessions.filter(session => !search || [session.title, session.sessionId, session.cwd].some(value => String(value || '').toLowerCase().includes(search)))
@@ -615,12 +968,13 @@ window.__ModuleLoader__.load({
             h('section', { className: 'dch-session-panel', 'aria-label': '会话列表' },
               h('input', { type: 'search', className: 'dch-search', value: query, onChange: event => { setQuery(event.target.value); }, placeholder: '搜索标题、会话 ID 或工作目录', 'aria-label': '搜索会话' }),
               h('p', { className: 'dch-note dch-session-count' }, `${shown.length} 个会话 · 列表保留完整历史累计，步骤按所选范围筛选`),
-              h('div', { className: 'dch-session-list' }, ...shown.map(session => h('button', { type: 'button', className: `dch-session${selected === session.sessionId ? ' dch-session-selected' : ''}`, key: session.sessionId, onClick: () => { setSelected(session.sessionId); }, 'aria-pressed': selected === session.sessionId },
+              h('div', { className: 'dch-session-list' }, ...shown.map(session => h('button', { type: 'button', className: `dch-session${selected === session.sessionId ? ' dch-session-selected' : ''}`, key: session.sessionId, onClick: () => { setSelected(session.sessionId); setResultReference(null); }, 'aria-pressed': selected === session.sessionId },
                 h('strong', { title: session.sessionId }, session.title || '未命名会话'), session.role ? h('small', null, session.role === 'sub' ? '子会话' : '主会话') : null, h('span', { className: 'dch-dim dch-session-id', title: session.sessionId }, session.sessionId),
                 h('span', { className: 'dch-row-between' }, h('span', null, `累计命中 ${percent(session.cumulative?.hitRate)}`), h('span', { className: session.warningCount ? 'dch-tag dch-tag-warn' : 'dch-dim' }, session.warningCount ? `${session.warningCount} 次异常` : '无异常记录')),
                 session.cwd ? h('small', { className: 'dch-dim dch-ellipsis', title: session.cwd }, session.cwd.split(/[\\/]/).filter(Boolean).at(-1) || session.cwd) : null)), !loading && !shown.length ? h('p', { className: 'dch-empty' }, '没有匹配的会话') : null)),
             h('section', { className: 'dch-detail-panel', 'aria-label': '调用步骤明细' },
-              detailLoading ? h('p', { className: 'dch-empty', role: 'status' }, '正在读取调用步骤…') : detailError ? h('p', { className: 'dch-error', role: 'alert' }, detailError) : detail ? h(React.Fragment, null,
+              detailLoading ? h('p', { className: 'dch-empty', role: 'status' }, '正在读取调用步骤…') : detail ? h(React.Fragment, null,
+                h(AnalysisEvidence, { detail, error: detailError, reference: resultReference }),
                 h('div', { className: 'dch-detail-heading' }, h('h3', { title: detail.sessionId }, detail.title || '未命名会话'), h('p', { className: 'dch-note', title: summary(detail.cumulative) }, `累计命中 ${percent(detail.cumulative?.hitRate)} · 缓存 ${short(detail.cumulative?.cacheReadTokens)} tok · 未缓存 ${short(detail.cumulative?.inputTokens)} tok`), h('div', { className: 'dch-policy-actions' }, h(ContextLink, { sessionId: detail.sessionId, onNavigate: onClose }), h(Button, { onClick: () => { setCompactSession(detail.sessionId); } }, '生成精简副本')), h('p', { className: 'dch-note dch-copy-hint' }, '保留原会话，另建带摘要的副本；查看结果后手动继续。')),
                 h('div', { className: 'dch-row-between dch-call-toolbar' }, h('span', { className: 'dch-dim' }, `${filteredCalls.length} 个调用步骤`)),
                 h('div', { className: 'dch-table-scroll' }, h('table', { className: 'dch-call-table' },
@@ -634,9 +988,10 @@ window.__ModuleLoader__.load({
                       h('td', { className: 'dch-cause' }, warning ? h('span', { className: 'dch-tag dch-tag-warn' }, warning.category === 'expected-rebuild' ? warning.recovered ? '预期重建 · 后续恢复' : '压缩后预期重建' : warning.recovered ? '失效 · 后续恢复' : '缓存失效') : null,
                         changes.length ? h(Changes, { changes }) : warning ? h('span', { className: 'dch-dim' }, warning.summary || '原因待排查') : h('span', { className: 'dch-dim' }, calls.indexOf(call) === 0 ? '首次记录 / 冷启动' : finite(usage?.hitRate) ? '无异常记录' : '缓存 usage 未知')));
                   })))),
-                !filteredCalls.length ? h('p', { className: 'dch-empty' }, onlyWarnings ? '没有异常步骤' : '尚无调用记录') : null,
+                !filteredCalls.length ? h('p', { className: 'dch-empty' }, detail.coverage?.detailsAvailable === false
+                  ? '仅保留用量汇总，调用步骤未覆盖' : onlyWarnings ? '没有异常步骤' : '尚无调用记录') : null,
                 pageCount > 1 ? h('div', { className: 'dch-pagination' }, h(Button, { disabled: pageIndex === 0, onClick: () => { setPage(pageIndex - 1); } }, '上一页'), h('span', null, `${pageIndex + 1} / ${pageCount}`), h(Button, { disabled: pageIndex + 1 >= pageCount, onClick: () => { setPage(pageIndex + 1); } }, '下一页')) : null,
-              ) : h('p', { className: 'dch-empty' }, '选择一个会话查看步骤')));
+              ) : detailError ? h('p', { className: 'dch-error', role: 'alert' }, detailError) : h('p', { className: 'dch-empty' }, '选择一个会话查看步骤')));
       function activateTab(key, focus = false) {
         setActiveTab(key);
         if (focus) requestAnimationFrame(() => document.getElementById(`${dashboardId}-tab-${key}`)?.focus());
@@ -659,8 +1014,9 @@ window.__ModuleLoader__.load({
         panel('overview', '概览', data?.statistics ? h(StatisticsSummary, { statistics: data.statistics }) : h('div', { className: 'dch-metrics' }, h(Metric, { label: '缓存读取', value: known ? `${short(read)} tok` : '未知', detail: '已知用量合计' }), h(Metric, { label: '加权命中率', value: total > 0 ? percent(read / total) : '未知' }), h(Metric, { label: '未缓存输入', value: known ? `${short(miss)} tok` : '未知' }), h(Metric, { label: '异常步骤', value: exact(warningCount), detail: `${sessions.length} 个会话 · ${unknown} 个命中率未知` }))),
         panel('charts', '日期与模型', h(StatisticsCharts, { statistics: data?.statistics })),
         panel('sessions', '会话明细', h(React.Fragment, null,
+          h(SessionAnalysisSelector, { active: activeTab === 'sessions', onView: (id, reference) => { setSelected(id); setResultReference(reference ?? null); setDetailVersion(previous => previous + 1); } }),
           h('div', { className: 'dch-session-toolbar' }, h('label', { className: 'dch-check' }, h('input', { type: 'checkbox', checked: onlyWarnings, onChange: event => { setOnlyWarningsFilter(event.target.checked); } }), '只看异常'), h('span', { className: 'dch-note' }, '列表为历史累计，步骤按当前筛选展示')), sessionsContent)),
-        panel('settings', '设置', h(PolicyEditor)),
+        panel('settings', '设置', h(React.Fragment, null, h(PolicyEditor), h(ChildProtectionEditor), h(AnalysisCacheSettings))),
         h('details', { className: 'dch-coverage dch-data-notes', hidden: activeTab === 'settings' }, h('summary', null, coverageText),
           h('p', { className: 'dch-note' }, `${data?.generatedAt ? `更新于 ${time(data.generatedAt)}。` : ''}主会话、子会话与已记录辅助调用按归属去重。日期按上海时间；摘要优先采用已记录开始时间，其他历史采用回执时间。${data?.coverage?.activityUnknown ? `${data.coverage.activityUnknown} 个会话缺少活跃缓存，按创建时间回退。` : ''}未知用量不补零；变化线索来自本地对比。`)));
       return h(React.Fragment, null, inline ? h('section', { className: 'dch-settings-dashboard', 'aria-label': '缓存有效率看板' },
@@ -778,6 +1134,67 @@ window.__ModuleLoader__.load({
           active && job.state !== 'finalizing' ? h(Button, { onClick: () => { void decide('cancel'); }, disabled: busy || job.cancelRequested }, job.cancelRequested ? '正在取消…' : '取消生成') : null,
           job?.state === 'prepared' && job.available ? h(Button, { className: 'dch-button-primary', onClick: () => { void decide('start'); }, disabled: busy }, '创建副本并生成摘要') : null));
     }
+    function AnalysisCacheSettings() {
+      const [status, setStatus] = useState(null);
+      const [message, setMessage] = useState('');
+      const [busy, setBusy] = useState(false);
+      const alive = useRef(true);
+      useEffect(() => {
+        alive.current = true; const controller = new AbortController();
+        request('/analysis/cache', { signal: controller.signal }).then(value => { if (alive.current) setStatus(value); })
+          .catch(error => { if (!controller.signal.aborted && alive.current) setMessage(`分析缓存状态不可用：${error.message}`); });
+        return () => { alive.current = false; controller.abort(); };
+      }, []);
+      async function clear() {
+        if (busy) return; setBusy(true); setMessage('');
+        try {
+          await request('/analysis/cache/clear', { method: 'POST', body: '{}' });
+          const next = await request('/analysis/cache');
+          if (alive.current) { setStatus(next); setMessage('分析缓存已清理。现有会话和真实用量保留，下次分析会重新计算。'); }
+        } catch (error) { if (alive.current) setMessage(`清理尚未完成：${error.message}`); }
+        finally { if (alive.current) setBusy(false); }
+      }
+      return h('section', { className: 'dch-policy dch-cache-settings', 'aria-label': '本地分析缓存' },
+        h('h3', null, '本地分析缓存'),
+        h('p', { className: 'dch-note' }, '缓存只保存可重新计算的用量和比较事实，不复制提示词、回答或完整工具定义。旧缓存需校验后才作为当前结果。'),
+        status ? h('p', null, status.enabled === false ? '磁盘分析缓存未启用' : `${exact(status.entries)} 个会话 · ${short(status.bytes)} bytes${status.budget?.maxBytes ? ` / ${short(status.budget.maxBytes)} bytes 上限` : ''}`) : null,
+        status?.error ? h('p', { className: 'dch-note' }, '缓存存储暂不可用，仍可从会话只读重算。') : null,
+        h(Button, { disabled: busy || !status, onClick: () => { void clear(); } }, busy ? '清理中…' : '清理分析缓存'),
+        message ? h('p', { className: 'dch-note', role: 'status' }, message) : null);
+    }
+    function ChildProtectionEditor() {
+      const form = clientContext?.configForms?.get('cache-helper');
+      const snapshot = useSyncExternalStore(listener => form?.subscribe(listener) || (() => {}), () => form?.getSnapshot() || MISSING_FORM, () => MISSING_FORM);
+      const [draft, setDraft] = useState(null);
+      const [busy, setBusy] = useState(false);
+      const [message, setMessage] = useState('');
+      const [dirty, setDirty] = useState(false);
+      const alive = useRef(true);
+      useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+      useEffect(() => { if (!dirty) setDraft(snapshot.value?.childProtection ?? 'observe'); }, [snapshot, dirty]);
+      async function save() {
+        if (busy || !form || !snapshot.writable || !['observe', 'block'].includes(draft)) return;
+        setBusy(true); setMessage('');
+        try {
+          const accepted = await form.mutate([{ op: 'set', path: ['childProtection'], value: draft }], snapshot.revision);
+          if (!alive.current) return;
+          if (!accepted) { setMessage('配置已变化，草稿保留。请重新读取后保存。'); return; }
+          setDirty(false); setMessage('子任务保护模式已保存；已有待确认请求仍需明确决定。');
+        } catch (error) { if (alive.current) setMessage(`${error.message || '保存失败'}。草稿保留。`); }
+        finally { if (alive.current) setBusy(false); }
+      }
+      if (snapshot.status !== 'ready') return null;
+      return h('section', { className: 'dch-policy dch-child-policy', 'aria-label': '子任务保护策略' },
+        h('h3', null, '子任务缓存风险'),
+        h('p', { className: 'dch-note' }, '观察模式记录风险；阻断模式暂停高风险原生子请求，由浏览器用户决定。缺少可达确认入口或可信运行身份时会拒绝高风险发送。'),
+        h('label', null, '子任务保护模式', h('select', { value: draft ?? 'observe', 'aria-label': '子任务保护模式', disabled: busy || !snapshot.writable,
+          onChange: event => { setDraft(event.target.value); setDirty(true); setMessage(''); } },
+        h('option', { value: 'observe' }, '观察'), h('option', { value: 'block' }, '阻断并确认'))),
+        h(Button, { onClick: () => { void save(); }, disabled: busy || !dirty || !snapshot.writable }, '保存子任务策略'),
+        dirty ? h(Button, { disabled: busy, onClick: () => { setDirty(false); setDraft(snapshot.value?.childProtection ?? 'observe'); setMessage(''); } }, '重新读取子任务策略') : null,
+        h('p', { className: 'dch-note' }, '外部代理内部请求和辅助 purpose 调用仍不在门禁覆盖内。'),
+        message ? h('p', { role: 'status', className: 'dch-note' }, message) : null);
+    }
     function PolicyEditor() {
       const form = clientContext?.configForms?.get('cache-helper');
       const snapshot = useSyncExternalStore(listener => form?.subscribe(listener) || (() => {}), () => form?.getSnapshot() || MISSING_FORM, () => MISSING_FORM);
@@ -877,6 +1294,8 @@ body[data-ds-dark-theme] .dch-tag-warn{color:#d9a956}body[data-ds-dark-theme] .d
 @container dch-dashboard (min-width:820px){.dch-metrics,.dch-settings-dashboard .dch-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.dch-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dch-charts>.dch-note{grid-column:1/-1}.dch-chart-card{margin:0}}
 @container dch-dashboard (max-width:440px){.dch-filter-row{gap:8px}.dch-filter-row select{max-width:160px}.dch-tab{padding:6px 10px}.dch-card,.dch-policy{padding:12px}.dch-dashboard-grid,.dch-settings-dashboard .dch-dashboard-grid{grid-template-columns:minmax(0,1fr);height:auto}.dch-session-panel,.dch-settings-dashboard .dch-session-panel{border-right:0;border-bottom:1px solid var(--dch-line);height:174px}.dch-detail-panel{height:440px}.dch-session-toolbar>.dch-note{margin-left:0}.dch-metric,.dch-settings-dashboard .dch-metric:nth-child(n){padding:10px}.dch-metric>strong{font-size:18px}.dch-model-heading{gap:6px}.dch-copy-flow{gap:8px}}
 @media(prefers-reduced-motion:reduce){.dch-button{transition:none}}
+.dch-global-confirm{display:flex;align-items:center;justify-content:center;gap:6px;min-height:32px;max-width:100%;font-size:12px}.dch-confirm-rail{position:relative;min-width:0;width:32px;padding:6px}.dch-confirm-count{position:absolute;right:-3px;top:-4px;min-width:12px;padding:0 2px;line-height:14px;font-size:9px;border-radius:7px;background:#b7791f;color:white}.dch-pending-list{display:grid;gap:10px}.dch-pending-item{border:1px solid var(--dch-line,#ddd);border-radius:8px;padding:12px;overflow-wrap:anywhere}.dch-parent-pending{margin:6px 0;padding:8px;max-height:260px;overflow:auto;border:1px solid var(--dch-amber,#d39c2c);border-radius:8px}.dch-parent-pending>summary{font-size:12px;cursor:pointer}.dch-pending-item .dch-policy-actions{display:flex;flex-wrap:wrap;gap:6px}
+.dch-analysis-selector{margin:0 0 10px;padding:10px;border:1px solid var(--dch-line);border-radius:8px;background:var(--dch-bg)}.dch-analysis-body{margin-top:10px}.dch-catalog-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.dch-catalog-filters label{display:flex;flex-direction:column;gap:4px;font-size:11px;min-width:0}.dch-catalog-filters input,.dch-catalog-filters select{width:100%;box-sizing:border-box;min-width:0;border:1px solid var(--dch-line);border-radius:6px;background:var(--dch-bg);color:inherit;padding:6px}.dch-catalog-list{max-height:270px;overflow:auto;display:grid;gap:7px;margin:8px 0}.dch-catalog-row{display:flex;flex-direction:column;align-items:flex-start;gap:4px;border:1px solid var(--dch-line);border-radius:7px;padding:8px}.dch-catalog-row strong{font-size:12px;overflow-wrap:anywhere}.dch-catalog-row .dch-session-id{display:block;max-width:100%;overflow-wrap:anywhere}.dch-analysis-selector .dch-policy-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:8px 0}.dch-analysis-selection,.dch-analysis-progress{padding:10px;margin-top:10px;background:var(--dch-soft);border-radius:8px}.dch-analysis-results{display:grid;gap:7px;max-height:240px;overflow:auto;margin:8px 0}.dch-analysis-result{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px}.dch-analysis-evidence{padding:6px 0}.dch-cache-settings,.dch-child-policy{margin-top:12px}.dch-child-policy select{margin:8px;padding:5px;border:1px solid var(--dch-line);border-radius:6px;background:var(--dch-bg);color:inherit}
 `;
 
     function apply(ctx) {
@@ -905,6 +1324,7 @@ body[data-ds-dark-theme] .dch-tag-warn{color:#d9a956}body[data-ds-dark-theme] .d
       slot('conversation.input.dock', 'dsh-cache-helper-warnings', 10, WarnStrip);
       slot('conversation.chat.turnTail', 'dsh-cache-helper-turn-reading', 100, TurnCacheReading);
       slot('settings.section', 'dsh-cache-helper', 200, CacheSettings, { label: '缓存看板' });
+      slot('sidebar.footer.action', 'dsh-cache-helper-pending', 150, GlobalPending);
       ctx.effect(() => () => {
         style.remove();
         unwatchPolicy?.();
@@ -919,6 +1339,9 @@ body[data-ds-dark-theme] .dch-tag-warn{color:#d9a956}body[data-ds-dark-theme] .d
           record.listeners.clear();
         });
         records.clear();
+        clearInterval(pendingTimer); pendingTimer = null;
+        pendingFlight?.controller.abort(); pendingFlight = null; pendingGeneration++;
+        pendingListeners.clear();
       }, 'dsh-cache-helper client cleanup');
     }
     return { inject: ['slots', 'configForms'], apply };

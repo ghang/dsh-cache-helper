@@ -232,7 +232,8 @@ for (const scope of [
   { name: 'human-fork', meta: { parentSession: 'synthetic-parent', isSeeded: true }, gated: true },
 ]) {
   test(`scope: ${scope.name} has the expected native gate coverage`, async t => {
-    const h = await harness(t, { script: [{ text: 'first' }, { text: 'second' }] });
+    const h = await harness(t, { script: [{ text: 'first' }, { text: 'second' }],
+      config: { childProtection: scope.gated ? 'block' : 'observe' } });
     const remove = registerTool(h.ctx, 'a_probe');
     registerTool(h.ctx, 'z_probe');
     const agent = await h.agent(`scope-${scope.name}`, scope.meta);
@@ -250,6 +251,22 @@ for (const scope of [
       assert.equal(h.upstream.requests.length, 2);
       assert.equal(h.helper.gate.pendingFor(agent.session.header.id), null);
     }
+  });
+}
+
+for (const meta of [{ origin: 'subagent' }, { delegationDepth: 1 }]) {
+  test(`default child protection rejects high risk without native activation evidence: ${Object.keys(meta)[0]}`, async t => {
+    const h = await harness(t, { script: [{ text: 'first' }, { text: 'must not send' }] });
+    const remove = registerTool(h.ctx, 'a_probe'); registerTool(h.ctx, 'z_probe');
+    const agent = await h.agent('metadata-without-native-witness', meta);
+    await send(agent, 'First recorded input');
+    remove(); agent.followup(user('Tools changed without a native activation'));
+    await agent.whenIdle();
+    await assertNoExtraRequest(h.upstream, 1);
+    assert.equal(h.helper.gate.pendingFor(agent.session.id), null, 'Unsupported requests must not hang invisibly');
+    const observation = h.helper.children.observations({ sessionId: agent.session.id })[0];
+    assert.equal(observation.state, 'unsupported');
+    assert.match(observation.reason, /activation/);
   });
 }
 
