@@ -202,6 +202,8 @@ test('browser next: daily chart values appear immediately on hover and focus wit
   await tooltip.waitFor({ state: 'visible', timeout: 300 });
   assert.match(await tooltip.innerText(), /日期未知\s+调用 0 次\s+异常 未知 次/);
   await page.setViewportSize({ width: 360, height: 900 });
+  // Resize dismissal is asynchronous; finish it before starting a new focus interaction.
+  await tooltip.waitFor({ state: 'detached', timeout: 1000 });
   await column.focus();
   await unknown.focus();
   await tooltip.waitFor({ state: 'visible', timeout: 300 });
