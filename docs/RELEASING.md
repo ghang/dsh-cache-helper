@@ -148,6 +148,12 @@ PUBLIC_GIT_EMAIL="$PUBLIC_NOREPLY_EMAIL" npm run check:identity -- --all
 
 上传前对最终候选再核对一次文件清单、许可证、版本、SHA-256、身份门禁与 web 验收结果。发布说明注明已验证的 DSH 版本、功能和边界、升级方式与回滚方法。发布后再验证公开安装地址；只有取得公开地址并通过安装验证，才更新 README 的发行状态。
 
+优先使用已认证个人账号的 GitHub CLI，凭据有效时不重复网页登录。先查 `gh api user --jq .login`；Git SSH 登录与 Release API 权限分别核对。使用既有个人附注 tag 和 `gh release create <tag> --verify-tag --draft --notes-file <说明文件>` 创建草稿，再用 `gh release upload` 上传冻结 tgz 与 SHA256SUMS，下载验包后以 `gh release edit <tag> --draft=false --latest` 发布，最后匿名下载复验。所有命令显式指定 `--repo ghang/dsh-cache-helper`，不使用覆盖参数。
+
+使用外部发行工具时也必须验证准确 source commit、候选报告与包摘要、远端个人 tag 对象，以及该 SHA 的成功分支 CI 和两个 Node job。分支 push/PR 执行完整门禁；tag push 不再重复跑同一候选，tag 身份由发行步骤独立复核。成功 job 额外保留实际 tgz 14 天；该 workflow 调整尚需下一次推送后观察。
+
+中断后先读准确 tag 的真实 Release/资产状态；草稿只补缺失且未冲突的附件，已正式发行只核验。401/403/限流不能当成不存在，结果不确定不能直接重发；同名不同摘要保留现场并停止，不删除或覆盖旧包。[CLI 官方说明](https://cli.github.com/manual/gh_release_create)，核查日期 2026-10-26。
+
 每次公开提交前核对精确 noreply、实际仓库/远端和本次发布授权。新建榜单条目时复核届时指南中的仓库年龄、topic、分类、描述和 tarball 字段；只改本插件条目，检查通过、维护者合并与市场实际可见分别验收。
 
 ## npm 官方公共源发行
@@ -220,8 +226,9 @@ public_npm view "dsh-cache-helper@$EXPECTED_VERSION" \
 | 审核白名单导出 | `prepare:release` 已实现；只导出，不安装或公开发布 |
 | 本地完整候选检查 | `check:release` 已实现；包含完整源码和实际解包产物回归，输出内容摘要及报告 |
 | 真实 Git 身份检查 | `check:identity` 已实现；本地发行者提供已核对的精确 noreply，CI 定义显式使用同一个公开身份 |
-| 远端 CI | workflow 定义在 Node 22.19.0 / 24.18.1 检查实际提交身份与完整候选，并留存候选报告和校验值；PR 检查实际 head，完整历史及 tag 仍受审计。远端运行结果需另核验；没有公开发行步骤 |
-| 统一发行命令 | 尚未实现：需要串起身份/源校验、commit 与候选绑定、上传、等待公开、公共下载验包及回执，保留交互 2FA |
+| 远端 CI | Node 22.19.0 / 24.18.1 分支 push/PR 检查实际提交身份与完整候选，并留存报告/校验值和成功 tgz；tag 改为复用准确 SHA 的成功分支 run，由发行者独立查 tag。workflow 调整尚未推送；没有自动公开发行步骤 |
+| GitHub 发行 | 可由外部参数化工具串起账号、来源/报告/包、tag、CI、草稿、缺失附件、下载验包与回执；本仓不内置 Lab 工具，也不自动创建仓库、tag 或 push |
+| 跨渠道统一发行 | 尚未实现：npm 仍按独立配置和真实 TTY/2FA 执行，扫描/公开核验、市场与安装分别验收；GitHub 工具不能标记这些渠道完成 |
 | 其他插件复用 | 当前是流程和契约复用；专用包名、入口、宿主兼容测试和隐私模式不能假定通用 |
 
 现有自动化输出是本地候选状态；GitHub Release、npm、榜单合并、市场可见和本机升级由各自证据确认。新会话先核对源码/版本/运行来源与对应回执，再处理未完成阶段。

@@ -1,6 +1,9 @@
 name: Check public candidate
 on:
   push:
+    # Release tooling checks the existing branch run for the exact tagged SHA.
+    # A tag push must not rebuild and retest the same candidate a second time.
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 permissions:
@@ -43,3 +46,10 @@ jobs:
             .release/release-report.json
             .release/SHA256SUMS
           if-no-files-found: warn
+      - name: Retain verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-package-node-${{ matrix.node }}
+          path: .release/dsh-cache-helper.tgz
+          if-no-files-found: error
+          retention-days: 14
