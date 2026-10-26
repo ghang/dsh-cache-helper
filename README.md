@@ -2,7 +2,7 @@
 
 为 DeepSeek Harness（DSH）显示实际缓存命中量，在发送前确认大规模缓存风险，并保留异常记录与会话统计看板。
 
-**本次版本：0.3.0（2026-10-26）。** 本版加入有预算的持久分析缓存、选择历史会话的本地分析任务，以及父页面和全局可达的原生子 Agent 缓存确认。历史事实用于分析和展示，实时发送独立校验当前请求。发行可用状态分别以 [GitHub Release](https://github.com/ghang/dsh-cache-helper/releases/tag/v0.3.0) 和 [npm 准确版本](https://www.npmjs.com/package/dsh-cache-helper/v/0.3.0)为准；源码定稿和本地验证不替代渠道回执。
+**当前公开版本：0.3.0（2026-10-26）。** [GitHub Release](https://github.com/ghang/dsh-cache-helper/releases/tag/v0.3.0) 与 [npm](https://www.npmjs.com/package/dsh-cache-helper/v/0.3.0) 均已公开，两渠道下载与经过隔离宿主验证的冻结包逐字节一致。本版加入有预算的持久分析缓存、选择历史会话的本地分析任务，以及父页面和全局可达的原生子 Agent 缓存确认。历史事实用于分析和展示，实时发送独立校验当前请求。
 
 已验证宿主为 DSH `0.2.1-rc.2` 的 `web` profile，Node 范围为 `^22.19.0 || >=24.0.0`。此前公开的 `0.2.0` tag 与原包保留，市场索引、本机安装来源及其他宿主版本分别核对。
 
