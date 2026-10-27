@@ -155,31 +155,89 @@ const pending = index => ({ id: `pending-${index}`, sessionId: `child-${index}`,
   identity: { role: 'sub', directParentId: 'main', rootSessionId: 'main', activationGeneration: `activation-${index}` },
   baseline: { kind: index === 1 ? 'inherited' : 'own' }, changes: [{ kind: 'tools', message: '合成工具前缀变化' }] });
 
-test('browser iteration: parent and collapsed global entry share pending decisions and bounded stop outcomes', async t => {
+test('browser iteration: risk automatically opens one dialog and only deferred requests expose a centred reminder', async t => {
   const stub = harness({ pending: [pending(1), pending(2)] });
   const { page, requests, errors } = await fixture(t, { api: stub.api, globalPending: true, composerSessionId: 'main' });
   await page.getByText('2 个子任务请求等待缓存确认', { exact: true }).waitFor();
-  assert.equal(await page.getByRole('alertdialog').count(), 0, 'Child pending requests do not pile automatic modals');
-  await page.waitForFunction(() => document.querySelector('.dch-global-confirm')?.textContent.includes('(2)'));
+  const dialog = page.getByRole('alertdialog', { name: '缓存可能大规模失效', exact: true });
+  await dialog.waitFor();
+  assert.equal(await page.getByRole('alertdialog').count(), 1, 'Concurrent children share one automatic risk dialog');
+  assert.equal(await page.locator('.dch-global-confirm').count(), 0, 'The reminder is hidden before the user defers');
   assert.ok(requests.some(item => item.path.endsWith('/pending/reachable') && item.body?.reachable));
+  await dialog.getByRole('button', { name: '稍后处理', exact: true }).click();
+  await dialog.waitFor({ state: 'detached' });
+  const entry = page.getByRole('button', { name: '缓存失效待确认 2 项', exact: true });
+  await entry.waitFor();
+  assert.equal(await entry.textContent(), '缓存失效待确认2');
+  const layout = await entry.evaluate(button => {
+    const rect = button.getBoundingClientRect(), slot = button.parentElement.getBoundingClientRect();
+    const style = getComputedStyle(button);
+    return { width: rect.width, slotWidth: slot.width, centre: rect.x + rect.width / 2,
+      slotCentre: slot.x + slot.width / 2, justifyContent: style.justifyContent };
+  });
+  assert.ok(Math.abs(layout.width - layout.slotWidth) < 1, 'The wide reminder fills the sidebar action row');
+  assert.ok(Math.abs(layout.centre - layout.slotCentre) < 1, 'The wide reminder is centred');
+  assert.equal(layout.justifyContent, 'center');
+  await page.waitForTimeout(1700);
+  assert.equal(await dialog.count(), 0, 'Polling does not reopen an explicitly deferred candidate');
+  assert.equal(requests.some(item => item.path.endsWith('/decision') || item.path.endsWith('/children/stop')), false,
+    'Deferring makes no model or agent-control decision');
   await page.evaluate(() => window.__setWide(false));
-  const entry = page.getByRole('button', { name: '缓存待确认 2 项', exact: true });
   assert.equal(await entry.isVisible(), true);
   await entry.click();
-  const dialog = page.getByRole('dialog', { name: '缓存待确认', exact: true });
   await dialog.getByText('继承前缀', { exact: false }).waitFor();
   await dialog.locator('article').filter({ hasText: 'child-1' }).getByRole('button', { name: '继续本次发送' }).click();
-  await page.waitForFunction(() => document.querySelector('.dch-global-confirm')?.getAttribute('aria-label') === '缓存待确认 1 项');
+  await dialog.locator('article').filter({ hasText: 'child-1' }).waitFor({ state: 'detached' });
+  assert.equal(await page.locator('.dch-global-confirm').count(), 0, 'Reviewing the queue hides its reminder');
   assert.deepEqual(requests.find(item => item.path.endsWith('/decision')).body,
     { sessionId: 'child-1', id: 'pending-1', fingerprint: 'candidate-1', decision: 'confirm' });
   await dialog.locator('article').filter({ hasText: 'child-2' }).getByRole('button', { name: '停止此子任务' }).click();
-  await dialog.getByText('停止信号已接纳，尚未确认静止', { exact: true }).waitFor();
+  const stops = page.getByRole('alertdialog', { name: '子任务停止结果', exact: true });
+  await stops.getByText('停止信号已接纳，尚未确认静止', { exact: true }).waitFor();
   assert.equal(stub.state.stops[0].descendantsStopped, false);
-  await dialog.getByRole('button', { name: '关闭缓存确认列表' }).click();
+  await stops.getByRole('button', { name: '关闭', exact: true }).click();
+  assert.equal(await page.locator('.dch-global-confirm').count(), 0, 'An empty queue never leaves a reminder');
   await page.getByText('停止信号已接纳，尚未确认静止', { exact: true }).waitFor();
   await page.evaluate(() => window.__dispose());
   await page.waitForTimeout(100);
   for (const channel of stub.state.channels.values()) assert.equal(channel.reachable, false, 'Unmount revokes every confirmation reachability lease');
+  assert.deepEqual(errors, []);
+});
+
+test('browser iteration: a new or changed risk reopens the shared dialog while expired deferred requests disappear', async t => {
+  const stub = harness({ pending: [pending(1)] });
+  const { page, requests, errors } = await fixture(t, { api: stub.api, globalPending: true, composerSessionId: 'main' });
+  const dialog = page.getByRole('alertdialog', { name: '缓存可能大规模失效', exact: true });
+  await dialog.waitFor();
+  await dialog.getByRole('button', { name: '稍后处理', exact: true }).click();
+  await page.getByRole('button', { name: '缓存失效待确认 1 项', exact: true }).waitFor();
+  const deadline = stub.state.pending[0].expiresAt;
+  stub.state.pending.push(pending(2));
+  await dialog.getByText('2 条请求已暂停，等待你的决定', { exact: true }).waitFor();
+  assert.equal(await page.getByRole('alertdialog').count(), 1);
+  assert.equal(await page.locator('.dch-global-confirm').count(), 0);
+  assert.equal(stub.state.pending[0].expiresAt, deadline, 'New reminders do not renew another request deadline');
+  await dialog.getByRole('button', { name: '稍后处理', exact: true }).click();
+  stub.state.pending[0] = { ...stub.state.pending[0], fingerprint: 'replacement-request' };
+  await dialog.waitFor();
+  await dialog.getByRole('button', { name: '稍后处理', exact: true }).click();
+  stub.state.pending = [];
+  await page.locator('.dch-global-confirm').waitFor({ state: 'detached' });
+  assert.equal(await dialog.count(), 0);
+  assert.equal(requests.some(item => item.path.endsWith('/decision')), false);
+  assert.deepEqual(errors, []);
+});
+
+test('browser iteration: main and child risks share one modal and keep the main compaction action', async t => {
+  const main = { ...pending(0), sessionId: 'main', role: 'main', identity: { role: 'main' } };
+  const stub = harness({ pending: [main, pending(1)] });
+  const { page, errors } = await fixture(t, { api: stub.api, globalPending: true, composerSessionId: 'main' });
+  const dialog = page.getByRole('alertdialog', { name: '缓存可能大规模失效', exact: true });
+  await dialog.waitFor();
+  assert.equal(await page.getByRole('alertdialog').count(), 1);
+  await dialog.getByRole('article', { name: '会话 main 等待缓存确认', exact: true }).getByRole('button', { name: '生成精简副本', exact: true }).click();
+  await page.getByRole('dialog', { name: '生成精简副本', exact: true }).waitFor();
+  assert.equal(await page.getByRole('alertdialog').count(), 0);
   assert.deepEqual(errors, []);
 });
 

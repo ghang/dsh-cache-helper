@@ -251,9 +251,9 @@ window.__ModuleLoader__.load({
         onMouseDown: event => { if (event.target === event.currentTarget) close.current(); },
       }, h('section', { ref: panel, role: alert ? 'alertdialog' : 'dialog', 'aria-modal': true, 'aria-label': title, tabIndex: -1, className: `dch-modal ${className}`, 'aria-busy': busy },
         h('header', { className: 'dch-modal-header' }, h('div', null, h('h2', null, title), subtitle ? h('p', { className: 'dch-subtitle' }, subtitle) : null),
-          h(Button, { className: 'dch-icon-button', onClick: onClose, disabled: busy, 'aria-label': closeLabel ?? (alert ? '取消发送并关闭警告' : title === '生成精简副本' ? '关闭精简副本结果' : '关闭缓存看板'), title: alert ? '取消发送' : '关闭' }, h(Icon, { name: 'close', size: 18 }))), children)), document.body);
+          h(Button, { className: 'dch-icon-button', onClick: onClose, disabled: busy, 'aria-label': closeLabel ?? (alert ? '取消发送并关闭警告' : title === '生成精简副本' ? '关闭精简副本结果' : '关闭缓存看板'), title: closeLabel ?? (alert ? '取消发送' : '关闭') }, h(Icon, { name: 'close', size: 18 }))), children)), document.body);
     }
-    function Gate({ sessionId, pending, onDone, connectionError, onCompact }) {
+    function Gate({ sessionId, pending, onDone, connectionError, onCompact, onDefer }) {
       const [busy, setBusy] = useState(false);
       const [error, setError] = useState(null);
       const alive = useRef(true);
@@ -287,11 +287,12 @@ window.__ModuleLoader__.load({
           error ? h('p', { className: 'dch-error', role: 'alert' }, error) : null),
         h('footer', { className: 'dch-modal-footer' },
           h(Button, { onClick: () => { void decide('cancel'); }, disabled: busy, 'data-dch-autofocus': true }, busy ? '正在处理…' : '取消本次发送'),
+          h(Button, { onClick: onDefer, disabled: busy }, '稍后处理'),
           h(Button, { onClick: onCompact, disabled: busy || Boolean(connectionError) }, '生成精简副本'),
           h(Button, { className: 'dch-button-primary', disabled: busy || Boolean(connectionError), onClick: () => { void decide('confirm'); } }, '确认并发送')));
     }
     const baselineLabel = value => ({ own: '自身最近回执', inherited: '继承前缀', none: '首次请求', unknown: '基线未知' })[typeof value === 'string' ? value : value?.kind] || '基线未知';
-    function PendingList({ items, connectionError, onView }) {
+    function PendingList({ items, connectionError, onView, onCompact, onStop }) {
       const [actions, setActions] = useState({});
       const alive = useRef(true);
       const busy = useRef(new Set());
@@ -315,6 +316,7 @@ window.__ModuleLoader__.load({
           const result = await request(action === 'stop' ? '/children/stop' : '/decision', {
             method: 'POST', body: JSON.stringify(payload),
           });
+          if (action === 'stop' && alive.current) onStop?.();
           if (alive.current) setActions(previous => ({ ...previous, [key]: { done: true,
             message: action === 'stop' ? ({ stopped: '已确认此子任务静止', idle: '已确认此子任务静止',
               'stop-unconfirmed': '停止信号已接纳，尚未确认静止', superseded: '目标已有新输入，请查看当前子任务' })[result?.state] || '停止信号已接纳，未确认静止'
@@ -340,6 +342,7 @@ window.__ModuleLoader__.load({
             action?.done ? h('p', { role: 'status' }, action.message) : h('div', { className: 'dch-policy-actions' },
               h(Button, { disabled: action?.busy, onClick: () => { void act(item, 'cancel'); } }, '取消本次发送'),
               h(Button, { className: 'dch-button-primary', disabled: action?.busy || Boolean(connectionError), onClick: () => { void act(item, 'confirm'); } }, '继续本次发送'),
+              !child && onCompact ? h(Button, { disabled: action?.busy || Boolean(connectionError), onClick: () => onCompact(item.sessionId) }, '生成精简副本') : null,
               child ? h(Button, { disabled: action?.busy || Boolean(connectionError), onClick: () => { void act(item, 'stop'); } }, action?.busy ? '正在处理…' : '停止此子任务') : null),
             child ? h('p', { className: 'dch-note' }, '停止只针对这个子任务，不会自动停止它启动的子任务。') : null,
             onView ? h(Button, { onClick: () => onView(item.sessionId) }, '查看此会话') : null);
@@ -347,8 +350,16 @@ window.__ModuleLoader__.load({
     }
     function GlobalPending({ wide = true }) {
       const state = usePending();
-      const button = useRef(null);
-      const [open, setOpen] = useState(false);
+      const [deferred, setDeferred] = useState([]);
+      const [finished, setFinished] = useState([]);
+      const [compacting, setCompacting] = useState(null);
+      const [reviewStop, setReviewStop] = useState(false);
+      useEffect(() => {
+        const keys = new Set(state.pending.map(item => identity(item.sessionId, item)));
+        const retain = previous => previous.some(key => !keys.has(key)) ? previous.filter(key => keys.has(key)) : previous;
+        setDeferred(retain);
+        setFinished(retain);
+      }, [state.pending]);
       useEffect(() => {
         const channelId = `cache-confirm-${window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
         let sequence = 0;
@@ -356,7 +367,9 @@ window.__ModuleLoader__.load({
           void request('/pending/reachable', { method: 'POST', body: JSON.stringify({ channelId, seq: ++sequence, reachable }) }).catch(() => {});
         };
         const update = () => {
-          let node = button.current;
+          // This mounted component can always portal a risk dialog to the body.
+          // A hidden reminder must not disable confirmation before the first risk.
+          let node = document.body;
           let reachable = document.visibilityState !== 'hidden' && Boolean(node?.isConnected && node.getClientRects().length);
           for (let hops = 0; reachable && node && hops < 64; hops++, node = node.parentElement) {
             const style = getComputedStyle(node);
@@ -369,19 +382,30 @@ window.__ModuleLoader__.load({
         window.addEventListener('resize', update);
         return () => { clearInterval(timer); document.removeEventListener('visibilitychange', update); window.removeEventListener('resize', update); beat(false); };
       }, []);
-      const count = state.pending.length;
+      const items = state.pending.filter(item => !finished.includes(identity(item.sessionId, item)));
+      const count = items.length;
+      const open = !compacting && (reviewStop || count > 0 && items.some(item => !deferred.includes(identity(item.sessionId, item))));
+      const defer = () => { setDeferred(items.map(item => identity(item.sessionId, item))); setReviewStop(false); };
+      const singleMain = !reviewStop && count === 1 && items[0].role !== 'sub' && items[0].identity?.role !== 'sub' && !items[0].activationGeneration;
       return h(React.Fragment, null,
-        h('button', { ref: button, type: 'button', className: `dch-button dch-global-confirm${wide ? '' : ' dch-confirm-rail'}`,
-          'aria-label': `缓存待确认 ${count} 项`, title: `缓存待确认 ${count} 项`, onClick: () => { setOpen(true); void refreshPending(); } },
-        h(Icon, { name: count ? 'warning' : 'cache' }), wide ? `缓存确认${count ? ` (${count})` : ''}` : count ? h('span', { className: 'dch-confirm-count', 'aria-hidden': true }, count) : null),
-        open ? h(Modal, { title: '缓存待确认', subtitle: '主会话和子任务共享这一份队列', closeLabel: '关闭缓存确认列表', onClose: () => setOpen(false) },
+        count > 0 && !open && !compacting ? h('button', { type: 'button', className: `dch-button dch-global-confirm${wide ? '' : ' dch-confirm-rail'}`,
+          'aria-label': `缓存失效待确认 ${count} 项`, title: `缓存失效待确认 ${count} 项`, 'aria-haspopup': 'dialog', onClick: () => { setDeferred([]); void refreshPending(); } },
+          h(Icon, { name: 'warning', size: 16 }), wide ? h('span', null, '缓存失效待确认') : null,
+          h('span', { className: 'dch-confirm-count', 'aria-hidden': true }, count)) : null,
+        open && singleMain ? h(Gate, { key: identity(items[0].sessionId, items[0]), sessionId: items[0].sessionId, pending: items[0],
+          onDone: key => { setFinished(previous => [...previous, key]); void refreshPending(); }, connectionError: state.error,
+          onCompact: () => setCompacting(items[0].sessionId), onDefer: defer }) : null,
+        open && !singleMain ? h(Modal, { title: count ? '缓存可能大规模失效' : '子任务停止结果', subtitle: count ? `${count} 条请求已暂停，等待你的决定` : '停止信号与实际静止状态分别记录', alert: true, closeLabel: count ? '稍后处理并收起' : '关闭停止记录', onClose: defer },
           h('div', { className: 'dch-modal-body' },
             state.error ? h('p', { className: 'dch-error', role: 'alert' }, `${state.error}。连接恢复前无法批准请求。`) : null,
-            h('p', { className: 'dch-note' }, `子任务保护：${state.childProtection === 'block' ? '阻断并等待确认' : '观察，仅记录风险'}。`),
-            count ? h(PendingList, { items: state.pending, connectionError: state.error }) : h('p', { className: 'dch-empty' }, state.loading ? '正在读取确认队列…' : '当前没有等待确认的请求'),
+            h(PendingList, { items, connectionError: state.error, onCompact: setCompacting, onStop: () => setReviewStop(true) }),
             h(StopOutcomes, { items: state.stops }),
             state.observations.length ? h('details', null, h('summary', null, `最近观察到 ${state.observations.length} 项风险`),
-              ...state.observations.map((item, index) => h('p', { key: item.id || index, className: 'dch-note' }, `${item.sessionId || '子任务'} · ${baselineLabel(item.baseline ?? item.baselineKind)} · ${item.reason || '仅观察，未暂停此请求'}`))) : null)) : null);
+              ...state.observations.map((item, index) => h('p', { key: item.id || index, className: 'dch-note' }, `${item.sessionId || '子任务'} · ${baselineLabel(item.baseline ?? item.baselineKind)} · ${item.reason || '仅观察，未暂停此请求'}`))) : null),
+          h('footer', { className: 'dch-modal-footer' },
+            count ? h('p', { className: 'dch-note' }, '稍后处理会保留等待；子任务仍按原截止时间取消。') : null,
+            h(Button, { onClick: defer, 'data-dch-autofocus': true }, count ? '稍后处理' : '关闭'))) : null,
+        compacting ? h(CompactionDialog, { key: compacting, sessionId: compacting, onClose: () => { setCompacting(null); void refreshPending(); } }) : null);
     }
     function StopOutcomes({ items }) {
       if (!items?.length) return null;
@@ -534,23 +558,13 @@ window.__ModuleLoader__.load({
         dashboardFor === dashboardKey ? h(Dashboard, { key: dashboardKey, initialSessionId: sessionId, onClose: () => { setDashboardFor(null); } }) : null);
     }
     function CacheGate({ sessionId }) {
-      const state = useSession(sessionId);
       const queue = usePending();
-      const [finished, setFinished] = useState('');
-      const [compacting, setCompacting] = useState(false);
-      useEffect(() => { setCompacting(false); }, [sessionId]);
       if (!sessionId) return null;
-      const data = state && state.data;
-      const pending = data && data.pending;
-      const pendingKey = identity(sessionId, pending);
       const children = queue.pending.filter(item => item.sessionId === sessionId && (item.role === 'sub' || item.identity?.role === 'sub')
         || (item.directParentId ?? item.parentSessionId ?? item.identity?.directParentId) === sessionId);
       const stops = queue.stops.filter(item => item.sessionId === sessionId || item.parentSessionId === sessionId);
-      const ownMain = pending && pending.role !== 'sub' && pending.identity?.role !== 'sub';
       return h(React.Fragment, null,
-        children.length || stops.length ? h('details', { className: 'dch-parent-pending', open: true }, h('summary', null, `${children.length} 个子任务请求等待缓存确认${stops.length ? ` · ${stops.length} 条停止记录` : ''}`), h(PendingList, { items: children, connectionError: queue.error }), h(StopOutcomes, { items: stops })) : null,
-        !compacting && ownMain && pendingKey !== finished ? h(Gate, { key: pendingKey, sessionId, pending, onDone: setFinished, connectionError: state?.error, onCompact: () => { setCompacting(true); } }) : null,
-        compacting ? h(CompactionDialog, { key: sessionId, sessionId, onClose: () => { setCompacting(false); void refresh(sessionId); } }) : null);
+        children.length || stops.length ? h('details', { className: 'dch-parent-pending', open: true }, h('summary', null, `${children.length} 个子任务请求等待缓存确认${stops.length ? ` · ${stops.length} 条停止记录` : ''}`), h(PendingList, { items: children, connectionError: queue.error }), h(StopOutcomes, { items: stops })) : null);
     }
     function WarnStrip({ sessionId }) {
       const state = useSession(sessionId);
@@ -1294,7 +1308,7 @@ body[data-ds-dark-theme] .dch-tag-warn{color:#d9a956}body[data-ds-dark-theme] .d
 @container dch-dashboard (min-width:820px){.dch-metrics,.dch-settings-dashboard .dch-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.dch-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.dch-charts>.dch-note{grid-column:1/-1}.dch-chart-card{margin:0}}
 @container dch-dashboard (max-width:440px){.dch-filter-row{gap:8px}.dch-filter-row select{max-width:160px}.dch-tab{padding:6px 10px}.dch-card,.dch-policy{padding:12px}.dch-dashboard-grid,.dch-settings-dashboard .dch-dashboard-grid{grid-template-columns:minmax(0,1fr);height:auto}.dch-session-panel,.dch-settings-dashboard .dch-session-panel{border-right:0;border-bottom:1px solid var(--dch-line);height:174px}.dch-detail-panel{height:440px}.dch-session-toolbar>.dch-note{margin-left:0}.dch-metric,.dch-settings-dashboard .dch-metric:nth-child(n){padding:10px}.dch-metric>strong{font-size:18px}.dch-model-heading{gap:6px}.dch-copy-flow{gap:8px}}
 @media(prefers-reduced-motion:reduce){.dch-button{transition:none}}
-.dch-global-confirm{display:flex;align-items:center;justify-content:center;gap:6px;min-height:32px;max-width:100%;font-size:12px}.dch-confirm-rail{position:relative;min-width:0;width:32px;padding:6px}.dch-confirm-count{position:absolute;right:-3px;top:-4px;min-width:12px;padding:0 2px;line-height:14px;font-size:9px;border-radius:7px;background:#b7791f;color:white}.dch-pending-list{display:grid;gap:10px}.dch-pending-item{border:1px solid var(--dch-line,#ddd);border-radius:8px;padding:12px;overflow-wrap:anywhere}.dch-parent-pending{margin:6px 0;padding:8px;max-height:260px;overflow:auto;border:1px solid var(--dch-amber,#d39c2c);border-radius:8px}.dch-parent-pending>summary{font-size:12px;cursor:pointer}.dch-pending-item .dch-policy-actions{display:flex;flex-wrap:wrap;gap:6px}
+.dch-global-confirm{box-sizing:border-box;display:flex;align-items:center;justify-content:center;gap:8px;width:100%;min-width:0;min-height:36px;padding:8px 10px;margin:0 auto;border-radius:8px;font-size:12px;font-weight:500;line-height:18px;text-align:center}.dch-global-confirm>svg{flex:none;color:var(--color-amber-600,#b7791f)}.dch-confirm-count{flex:none;min-width:18px;padding:0 4px;border-radius:9px;background:var(--dsw-alias-interactive-bg-hover,#edeef2);color:var(--dsw-alias-label-secondary,#737382);font-size:10px;line-height:18px;text-align:center}.dch-confirm-rail{position:relative;width:36px;padding:8px}.dch-confirm-rail .dch-confirm-count{position:absolute;right:-3px;top:-3px;min-width:12px;padding:0 2px;line-height:14px;font-size:9px;background:#b7791f;color:white}.dch-pending-list{display:grid;gap:10px}.dch-pending-item{border:1px solid var(--dch-line,#ddd);border-radius:8px;padding:12px;overflow-wrap:anywhere}.dch-parent-pending{margin:6px 0;padding:8px;max-height:260px;overflow:auto;border:1px solid var(--dch-amber,#d39c2c);border-radius:8px}.dch-parent-pending>summary{font-size:12px;cursor:pointer}.dch-pending-item .dch-policy-actions{display:flex;flex-wrap:wrap;gap:6px}
 .dch-analysis-selector{margin:0 0 10px;padding:10px;border:1px solid var(--dch-line);border-radius:8px;background:var(--dch-bg)}.dch-analysis-body{margin-top:10px}.dch-catalog-filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.dch-catalog-filters label{display:flex;flex-direction:column;gap:4px;font-size:11px;min-width:0}.dch-catalog-filters input,.dch-catalog-filters select{width:100%;box-sizing:border-box;min-width:0;border:1px solid var(--dch-line);border-radius:6px;background:var(--dch-bg);color:inherit;padding:6px}.dch-catalog-list{max-height:270px;overflow:auto;display:grid;gap:7px;margin:8px 0}.dch-catalog-row{display:flex;flex-direction:column;align-items:flex-start;gap:4px;border:1px solid var(--dch-line);border-radius:7px;padding:8px}.dch-catalog-row strong{font-size:12px;overflow-wrap:anywhere}.dch-catalog-row .dch-session-id{display:block;max-width:100%;overflow-wrap:anywhere}.dch-analysis-selector .dch-policy-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:8px 0}.dch-analysis-selection,.dch-analysis-progress{padding:10px;margin-top:10px;background:var(--dch-soft);border-radius:8px}.dch-analysis-results{display:grid;gap:7px;max-height:240px;overflow:auto;margin:8px 0}.dch-analysis-result{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px}.dch-analysis-evidence{padding:6px 0}.dch-cache-settings,.dch-child-policy{margin-top:12px}.dch-child-policy select{margin:8px;padding:5px;border:1px solid var(--dch-line);border-radius:6px;background:var(--dch-bg);color:inherit}
 `;
 

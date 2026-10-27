@@ -93,7 +93,7 @@ node scripts/replay-session.mjs /absolute/path/session.v4.jsonl.zstd
 
 `AnalysisJobs` 串行执行，reuse/refresh 明确区分；每项都是 AnalysisService 的独立消费者。取消/超时仅退出本任务订阅，最后一个共享消费者才取消共同计算；重启中的任务标 interrupted，不自动续跑。预算按当次 stat 和批次剩余额度重新检查，不能只信排队前的目录。cold 已知 bytes 超限在 open 前拒绝；live bytes 未知保守预留，metadata/read 竞态和宿主完整解码限制仍不能作为物理解码内存硬限。任务文件仅保留 ID、稳定水位/覆盖、幂等 hash 和状态；不保存 opaque revision、标题/cwd 或 prompt。默认最多 100 所选、4 排队/运行、单项 200k 事件/32 MiB/30s、整批 400k/64 MiB/120s，终态最多 50/7 天/1 MiB。
 
-主/子门禁仍读取 live options 和有效回执，缓存从不批准发送。原生 `subagent/start` 的 runId/local 与 exact Agent/Session 共同证明 activation，`parentSession` 结合 child 分类证明直接父；缺证据不伪造代际。block 模式高风险无可达通道或原生证据时明确拒绝；observe 仅记录。侧栏实际可见组件用单调序号心跳，15s 过期，关闭/hidden 发送 false，迟到 true 不能复活旧通道；心跳不延长 120s pending 截止。确认绑定指纹、政策、基线、请求相关 cut、Session 和 activation；无关 log-only catalog 追加不误失效，steer/投影/路由变化拒绝旧确认。
+主/子门禁仍读取 live options 和有效回执，缓存从不批准发送。原生 `subagent/start` 的 runId/local 与 exact Agent/Session 共同证明 activation，`parentSession` 结合 child 分类证明直接父；缺证据不伪造代际。block 模式高风险无可达通道或原生证据时明确拒绝；observe 仅记录。全局组件挂载后可向 body portal 自动确认弹窗，以页面实际可见性维护单调序号心跳，15s 过期，卸载/hidden 发送 false，迟到 true 不能复活旧通道；提醒按钮隐藏不撤销这个已挂载的自动通道，心跳不延长 120s pending 截止。主/子共用一个全局弹窗，稍后处理状态绑定 sessionId/id/fingerprint，只保留当前队列候选；新候选主动提醒，已处理/到期项清除状态。确认绑定指纹、政策、基线、请求相关 cut、Session 和 activation；无关 log-only catalog 追加不误失效，steer/投影/路由变化拒绝旧确认。
 
 定向停止只调用原生 interrupt 并核验直接父和同 pending；accepted 后最多观察 3s，stopping/stopped/stop-unconfirmed/superseded 分开留在全局和父页，不借用 dispose/drain 停整树。父释放不假定级联；目标 abort/end/unload 清理 pending。原生 child cancel 的结果投递可能合法唤醒父 Agent，测试按目标候选/回执证明子请求未发，不将父的正常结算误认为插件自动重试。
 

@@ -110,7 +110,7 @@ export async function fixture(t, options = {}) {
       __plugin.apply({slots:{inject(name,callback){return callback()},register(meta,component){__registrations.push({meta,component});return()=>{}}},configForms:{get(id){return __formEnabled?__form:undefined}},get(name){return services[name]},effect(effect){__cleanups.push(effect())}});
       const root=ReactDOM.createRoot(document.getElementById('app'));let generation=0;
       const draw=()=>root.render(React.createElement(React.StrictMode,null,
-        ${options.globalPending ? "React.createElement(__registrations.find(item=>item.meta.id==='dsh-cache-helper-pending').component,{wide:window.__wide,key:'pending'})," : ''}
+        ${options.globalPending ? "React.createElement('aside',{key:'pending',style:{width:window.__wide?240:56,padding:8,boxSizing:'border-box'}},React.createElement('div',{style:{display:'flex',width:'100%'}},React.createElement(__registrations.find(item=>item.meta.id==='dsh-cache-helper-pending').component,{wide:window.__wide})))," : ''}
         ${options.composerSessionId ? "React.createElement(__registrations.find(item=>item.meta.id==='dsh-cache-helper-gate').component,{sessionId:"+JSON.stringify(options.composerSessionId)+",key:'composer'})," : ''}
         React.createElement(__registrations.find(item=>item.meta.id==='dsh-cache-helper').component,{key:generation})));
       window.__render=()=>{generation++;draw()};window.__setWide=value=>{window.__wide=value;draw()};

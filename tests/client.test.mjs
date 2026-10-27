@@ -72,6 +72,11 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
       json(response, sessions[id], failSession && id === 'alpha' || failDetailId === id ? 503 : 200);
       return;
     }
+    if (url.pathname === '/dsh-cache-helper/api/pending') {
+      json(response, { pending: Object.values(sessions).map(item => item.pending).filter(Boolean),
+        stops: [], observations: [], childProtection: 'block' }, failSession ? 503 : 200);
+      return;
+    }
     if (url.pathname === '/dsh-cache-helper/api/dashboard') {
       json(response, { sessions: emptyDashboard ? [] : Object.values(sessions).filter(item => item.sessionId !== 'late').map(item => ({ sessionId: item.sessionId, title: item.title, cumulative: item.cumulative, latest: item.latest, warningCount: item.warnings.length })), generatedAt: Date.now(), coverage: { scanned: emptyDashboard ? 0 : 2, limit: 100, errors: [] } }, failDashboard ? 503 : 200);
       return;
@@ -166,9 +171,10 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
           h('nav',{className:'fixture-settings-nav'},h('div',{className:'fixture-settings-navTitle'},'设置'),h('div',{className:'fixture-settings-navList'},...rows.map(row=>h('button',{key:row.id,type:'button',className:'fixture-settings-navCell'+(active===row.id?' fixture-settings-active':''),'aria-current':active===row.id?'true':undefined,onClick:()=>setActive(row.id)},row.label)))),
           h('div',{className:'fixture-settings-content'},h('header',{className:'fixture-settings-header'},h('div',{className:'fixture-settings-actions'}),h('button',{type:'button',className:'fixture-settings-close',onClick:close,'aria-label':'关闭原生设置'},'×')),h('div',{className:'fixture-settings-options'},active==='dsh-cache-helper'?h(__registrations[3].component,{close}):h('p',null,'原生设置内容'))))),document.body):h('p',null,'设置已关闭');
       }
-      window.__render=(id,options={})=>root.render(h(React.StrictMode,null,h(Fixture,{id,options})));
+      const globalPending=()=>h(__registrations.find(item=>item.meta.name==='sidebar.footer.action').component,{key:'global-pending'});
+      window.__render=(id,options={})=>root.render(h(React.StrictMode,null,globalPending(),h(Fixture,{id,options})));
       let settingsGeneration=0;
-      window.__renderSettings=(options={})=>root.render(h(React.StrictMode,null,options.withConversation?h(Fixture,{id:'alpha',options:{lateFooter:true}}):null,h(SettingsFixture,{key:++settingsGeneration})));
+      window.__renderSettings=(options={})=>root.render(h(React.StrictMode,null,globalPending(),options.withConversation?h(Fixture,{id:'alpha',options:{lateFooter:true}}):null,h(SettingsFixture,{key:++settingsGeneration})));
       window.__cleanup=()=>{root.unmount();__cleanups.forEach(cleanup=>cleanup&&cleanup())};__render('alpha');
     </script></body></html>`);
   });
@@ -344,6 +350,11 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     sessions.alpha.pending = pending('failure');
     await page.getByRole('alertdialog').waitFor();
     failDecision = true;
+    await page.getByRole('button', { name: '稍后处理', exact: true }).click();
+    await page.getByRole('alertdialog').waitFor({ state: 'detached' });
+    assert.equal(sessions.alpha.pending.id, 'failure', 'Deferring preserves the frozen candidate');
+    assert.equal(decisions.length, 1, 'Deferring does not send a decision');
+    await page.getByRole('button', { name: '缓存失效待确认 1 项', exact: true }).click();
     await page.getByRole('button', { name: '确认并发送', exact: true }).click();
     await page.getByRole('alert').getByText(/请求仍未获准发送/).waitFor();
     assert.equal(sessions.alpha.pending.id, 'failure');
@@ -361,6 +372,7 @@ test('browser: per-turn native footer placement, explicit decisions, isolation a
     await page.getByRole('alertdialog').waitFor();
     failSession = true;
     await page.getByText('与宿主连接中断。请求保持等待，连接恢复前无法确认。').waitFor();
+    await tail(16).locator('[data-dsh-cache-helper="turn-reading"].dch-stale').waitFor();
     assert.match(await tail(16).locator('[data-dsh-cache-helper="turn-reading"]').getAttribute('title'), /更新失败，显示上次读取结果/);
     assert.equal(await page.getByRole('button', { name: '确认并发送', exact: true }).isDisabled(), true);
     await page.keyboard.press('Escape');
