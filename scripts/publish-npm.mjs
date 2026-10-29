@@ -119,6 +119,13 @@ async function download(asset) {
   require(size === asset.size && 'sha256:' + hash(bytes) === asset.digest, 'release-download-digest-mismatch');
   return bytes;
 }
+export async function readReleaseArtifacts(assets, readAsset = download) {
+  const [bytes, sums] = await Promise.all([
+    readAsset(assets.find(asset => asset.name.endsWith('.tgz'))),
+    readAsset(assets.find(asset => asset.name === 'SHA256SUMS')),
+  ]);
+  return { bytes, sums };
+}
 async function successfulCI(commit) {
   for (let page = 1; page <= 10; page++) {
     const { workflow_runs: runs } = github(`actions/workflows/check.yml/runs?head_sha=${commit}&status=success&per_page=100&page=${page}`);
@@ -180,7 +187,7 @@ async function main() {
     const release = github('releases/tags/' + tag), assets = checkRelease(release, tag);
     const ci = await successfulCI(commit);
     Object.assign(receipt, { sourceCommit: commit, sourceTree: git('rev-parse', commit + '^{tree}'), tagObject, ciRunId: ci.id, releaseUrl: release.html_url, sha256: assets[0].digest.slice(7), bytes: assets[0].size });
-    const [bytes, sums] = await Promise.all([download(assets[0]), download(assets[2])]);
+    const { bytes, sums } = await readReleaseArtifacts(assets);
     checkChecksums(sums, assets);
     work = await mkdtemp(join(tmpdir(), 'cache-helper-npm-'));
     const archive = join(work, assets[0].name), user = join(work, 'user.npmrc'), global = join(work, 'global.npmrc');

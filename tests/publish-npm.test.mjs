@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PACKAGE, REPOSITORY, hash, versionFromTag, checkManifest, checkRelease, checkChecksums, checkCI, checkNpmMetadata, checkPublishContext, cleanNpmEnvironment, checkLatest, waitForStableLatest, completePublication } from '../scripts/publish-npm.mjs';
+import { PACKAGE, REPOSITORY, hash, versionFromTag, checkManifest, checkRelease, checkChecksums, readReleaseArtifacts, checkCI, checkNpmMetadata, checkPublishContext, cleanNpmEnvironment, checkLatest, waitForStableLatest, completePublication } from '../scripts/publish-npm.mjs';
 
 const bytes = Buffer.from('synthetic frozen package');
 const version = '0.3.2', tag = 'v' + version, commit = 'a'.repeat(40);
@@ -30,6 +30,17 @@ test('release CI must cover the same SHA, approved workflow and both successful 
   checkCI(run(), jobs(), commit);
   for (const change of [{ head_sha: 'b'.repeat(40) }, { event: 'pull_request' }, { conclusion: 'failure' }, { path: '.github/workflows/other.yml' }, { head_repository: { full_name: 'example/fork' } }]) assert.throws(() => checkCI({ ...run(), ...change }, jobs(), commit));
   for (const value of [jobs().slice(0, 1), [...jobs(), jobs()[0]], jobs().map(job => ({ ...job, conclusion: 'skipped' }))]) assert.throws(() => checkCI(run(), value, commit));
+});
+test('the two-asset cache-helper release reads its tgz and checksum without an alias slot', async () => {
+  const assets = checkRelease(release(), tag), names = [];
+  const sums = Buffer.from(hash(bytes) + '  ' + PACKAGE + '.tgz\n');
+  const result = await readReleaseArtifacts(assets, async asset => {
+    assert.ok(asset); names.push(asset.name);
+    return asset.name === 'SHA256SUMS' ? sums : bytes;
+  });
+  assert.deepEqual(names.sort(), ['SHA256SUMS', PACKAGE + '.tgz'].sort());
+  assert.equal(result.bytes, bytes); assert.equal(result.sums, sums);
+  checkChecksums(result.sums, assets);
 });
 test('npm metadata must identify the same tarball through both digests and its public URL', () => {
   checkNpmMetadata(metadata(), bytes, version);
