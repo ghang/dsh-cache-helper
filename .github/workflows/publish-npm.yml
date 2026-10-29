@@ -22,7 +22,7 @@ jobs:
   publish:
     if: github.repository == 'ghang/dsh-cache-helper'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 35
     permissions:
       contents: read
       actions: read

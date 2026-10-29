@@ -84,7 +84,8 @@ function compareStableVersions(left, right) {
   return 0;
 }
 export async function waitForStableLatest(readLatest, version, wait = delay) {
-  for (let attempt = 0; attempt < 24; attempt++) {
+  const until = Date.now() + 5 * 60_000;
+  for (let attempt = 0; attempt < 60 && Date.now() < until; attempt++) {
     const latest = await readLatest();
     if (compareStableVersions(latest.version, version) >= 0) return latest.version;
     await wait(5000);
@@ -160,7 +161,9 @@ export async function completePublication({ mode, existing, latest, bytes, versi
   if (mode === 'verify') return { status: 'verified-ready', npmWriteAttempted: false };
   // Query before every attempt; never automatically retry an uncertain write.
   await publish();
-  for (let attempt = 0; attempt < 24; attempt++) {
+  // npm scans uploads before public availability; allow about twenty minutes.
+  const until = Date.now() + 20 * 60_000;
+  for (let attempt = 0; attempt < 240 && Date.now() < until; attempt++) {
     const metadata = await readVersion();
     if (metadata) {
       checkNpmMetadata(metadata, bytes, version); await verifyPublic(metadata, bytes);

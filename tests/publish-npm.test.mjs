@@ -84,3 +84,12 @@ test('an uncertain npm write or unavailable public package is not retried or cou
   await assert.rejects(completePublication({ ...input, publish: async () => {}, readVersion: async () => metadata(), verifyPublic: async () => { throw new Error('not-public'); } }), /not-public/);
   await assert.rejects(completePublication({ ...input, publish: async () => {}, readVersion: async () => null, wait: async () => {} }), /not-visible/);
 });
+
+test('publication visibility can outlast the original two-minute window without another upload', async () => {
+  let writes = 0, reads = 0;
+  const result = await completePublication({ mode: 'publish', existing: null, latest: null, bytes, version,
+    publish: async () => { writes++; }, readVersion: async () => ++reads < 40 ? null : metadata(),
+    verifyPublic: async () => {}, wait: async () => {},
+  });
+  assert.equal(result.status, 'published-verified'); assert.equal(writes, 1); assert.equal(reads, 40);
+});
