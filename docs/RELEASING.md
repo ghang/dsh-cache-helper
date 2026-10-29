@@ -2,7 +2,41 @@
 
 本文件定义独立源码、提交身份、安装验证和公开发行的流程。构建与本地准备命令不自动创建 Git 仓库、提交、tag、Release、npm 发布或插件榜投稿；公开动作按当前任务的明确授权执行。已经明确授权的同一版本和目标渠道不重复询问。
 
-本插件已使用独立公开仓库，并已发行 `0.1.2`、`0.2.0`、`0.3.0`。后续迭代沿用现有历史、身份和渠道；首次建仓、注册账号和榜单投稿不需要每版重做。发行记录、是否收录和本机是否升级仍按实际证据分别更新。
+本插件已使用独立公开仓库，并已发行 `0.1.2`、`0.2.0`、`0.3.0`、`0.3.1`。后续迭代沿用现有历史、身份和渠道；首次建仓、注册账号和榜单投稿不需要每版重做。发行记录、是否收录和本机是否升级仍按实际证据分别更新。
+
+## npm OIDC 发布
+
+从0.3.2起提供 `.github/workflows/publish-npm.yml`。先审查源码、生成独立候选、
+核对同SHA双Node成功CI并建立个人附注tag；GitHub Release公开后，托管Ubuntu
+runner核对固定名 `dsh-cache-helper.tgz` 和 `SHA256SUMS` 的服务端SHA-256/长度，
+读取同一原包直接发布npm。此仓不要求额外的版本名tgz别名，不重建发行包。
+
+一次性在npm包的Trusted Publisher中绑定owner `ghang`、repository
+`dsh-cache-helper`、workflow filename `publish-npm.yml`，不设environment，
+允许直接 `npm publish`。首次绑定需要二次验证，新绑定须2天内完成首次成功
+发布。先让workflow存在并通过检查，再临近获授权的新版本时绑定。
+[npm官方配置规则](https://docs.npmjs.com/trusted-publishers/)，核查日期2026-10-30。
+
+发布job仅使用 `contents: read`、`actions: read`、`id-token: write`；不保存长期
+npm Token，在空工作目录使用不同的空user/global配置并清理环境认证覆盖。
+已有版本核对npm SHA-1/SHA-512及公开HEAD，不重复上传；稳定版latest有界等待，
+允许核验已被更高稳定版取代的历史版本，不回退指针。同包不同版本的发布串行。
+回执保存在 `npm-publication-<run>-<attempt>` Actions artifact。
+
+先验证读取路径，或在明确授权后恢复对应新tag的发行：
+
+```sh
+gh workflow run publish-npm.yml --repo ghang/dsh-cache-helper \
+  --ref main -f tag=v0.3.1 -f mode=verify
+gh workflow run publish-npm.yml --repo ghang/dsh-cache-helper \
+  --ref v0.3.2 -f tag=v0.3.2 -f mode=publish
+```
+
+手动publish要求工作流ref和SHA均对应待发tag。verify成功只证明读取/摘要路径，
+首次真实新版本发行才证明OIDC绑定生效。原TTY发布方法作为人工恢复路径保留。
+若以后由Actions的 `GITHUB_TOKEN` 创建Release，应在同工作流发布npm或显式
+dispatch，不能依赖该Token再次触发release事件。
+[GitHub触发规则](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)。
 
 ## 交付状态
 
@@ -11,8 +45,8 @@
 | 本地候选 | 版本一致，干净构建、测试和包检查完成，生成可核对的 tgz |
 | web 验证 | 候选安装到 web，确认读数、门禁、WARN、看板、停用、卸载与回滚 |
 | 公开源码 | 首次迁移通过审核白名单建立独立历史；后续版本在同一仓库通过内容与身份检查后推送 |
-| GitHub Release | 获授权后，上传已校验的预构建 tgz、校验值与对应版本说明，并下载验包 |
-| npm | 目标账户与源正确，准确版本已公开，公共 tarball 与已验证候选的摘要及字节一致 |
+| GitHub Release | 获授权后上传冻结tgz与校验值，可信服务端SHA-256和长度一致；无摘要时另行下载验证 |
+| npm | 发布身份与源正确，准确版本已公开，SHA-1/SHA-512与冻结包一致，公共tarball可用，latest策略正确 |
 | 插件榜 | 公开源码与可安装产物就绪后，按届时指南提交并等待收录 |
 
 本地安装成功、测试通过或产物生成，都不能标记为已经公开发布。
@@ -217,7 +251,7 @@ public_npm view "dsh-cache-helper@$EXPECTED_VERSION" \
 }
 ```
 
-可信发布者/OIDC、staged publishing 或新增发布权限属于另外的设置，不是现有自动化能力，也不能因为遇到认证问题就自动开启或降低 2FA。
+本仓已提供上述OIDC工作流，首次信任配置与实际发布必须分别验收。账号2FA保留；staged publishing或其他新增权限另按实际需求配置，不因认证失败而自动扩大权限。
 
 ## 现有自动化与后续缺口
 

@@ -1,0 +1,53 @@
+name: Publish npm package
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to check (run publish mode from this tag)
+        required: true
+        type: string
+      mode:
+        description: Verify without publishing, or resume an approved release
+        required: true
+        default: verify
+        type: choice
+        options: [verify, publish]
+permissions: {}
+concurrency:
+  group: npm-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'ghang/dsh-cache-helper'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.18.1'
+      - name: Verify the frozen release and publish with npm OIDC
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          PUBLISH_MODE: ${{ github.event_name == 'release' && 'publish' || inputs.mode }}
+          NPM_PUBLISH_RECEIPT: ${{ runner.temp }}/npm-publication.json
+        run: node scripts/publish-npm.mjs
+      - name: Retain the publication receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/npm-publication.json
+          if-no-files-found: warn
+          retention-days: 90

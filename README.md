@@ -2,7 +2,9 @@
 
 为 DeepSeek Harness（DSH）显示实际缓存命中量，在发送前确认大规模缓存风险，并保留异常记录与会话统计看板。
 
-**版本：0.3.1（2026-10-27）。** 安装产物见 [GitHub Releases](https://github.com/ghang/dsh-cache-helper/releases) 与 [npm](https://www.npmjs.com/package/dsh-cache-helper)。主会话与子任务触发风险时自动弹窗，多个请求共用一个弹窗；选择“稍后处理”后才显示居中铺满的“缓存失效待确认”侧栏入口，处理完毕或到期后自动隐藏。
+**版本：0.3.2（2026-10-30）。** 本版仅更新发行工作流和维护文档：GitHub Release 可通过 Actions OIDC 将同一冻结包发布到 npm，账号保留二次验证。安装产物及实际公开状态见 [GitHub Releases](https://github.com/ghang/dsh-cache-helper/releases) 与 [npm](https://www.npmjs.com/package/dsh-cache-helper)。
+
+主会话与子任务触发风险时自动弹窗，多个请求共用一个弹窗；选择“稍后处理”后才显示居中铺满的“缓存失效待确认”侧栏入口，处理完毕或到期后自动隐藏。
 
 本版保留有预算的持久分析缓存、选择历史会话的本地分析任务和原生子 Agent 保护。历史事实用于分析和展示，实时发送独立校验当前请求。“稍后处理”不批准发送，也不延长原有等待期限。
 
