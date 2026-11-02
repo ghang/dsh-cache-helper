@@ -2,7 +2,7 @@
 
 为 DeepSeek Harness（DSH）显示实际缓存命中量，在发送前确认大规模缓存风险，并保留异常记录与会话统计看板。
 
-**版本：0.3.3-rc.1（2026-11-03，本地修复候选，未公开发行）。** 本轮补齐风险弹窗的项目与会话身份，以“忽略该会话”替换精简副本入口，并修复附件比较与 Windows 事实缓存读取。已公开版本仍见 [GitHub Releases](https://github.com/ghang/dsh-cache-helper/releases) 与 [npm](https://www.npmjs.com/package/dsh-cache-helper)。
+**版本：0.3.3（2026-11-03）。** 本版补齐风险弹窗的项目与会话身份，以“忽略该会话”替换精简副本入口，并修复附件比较与 Windows 事实缓存读取。实际公开版本见 [GitHub Releases](https://github.com/ghang/dsh-cache-helper/releases) 与 [npm](https://www.npmjs.com/package/dsh-cache-helper)。
 
 主会话与子任务触发风险时自动弹窗，多个请求共用一个弹窗；选择“稍后处理”后才显示居中铺满的“缓存失效待确认”侧栏入口，处理完毕或到期后自动隐藏。
 
@@ -10,7 +10,7 @@
 
 已验证宿主为 DSH `0.2.1-rc.2` 的 `web` profile，Node 范围为 `^22.19.0 || >=24.0.0`。此前公开的 `0.3.0` tag 与原包保留，市场索引、本机安装来源及其他宿主版本分别核对。
 
-原生子任务默认 `childProtection: block`：高风险请求等待可达浏览器确认，缺可信原生证据或确认入口时明确拒绝；需要只记录时可在设置改为 `observe`。原待确认请求不会因策略保存自动放行。派生缓存/分析任务不修改 Session 真源，不注册模型工具或注入 system；安装和重启请安排在任务间隙。回滚使用 `v0.3.0` 冻结包，保留原会话和配置。
+原生子任务默认 `childProtection: block`：高风险请求等待可达浏览器确认，缺可信原生证据或确认入口时明确拒绝；需要只记录时可在设置改为 `observe`。原待确认请求不会因策略保存自动放行。派生缓存/分析任务不修改 Session 真源，不注册模型工具或注入 system；安装和重启请安排在任务间隙。回滚使用原 `v0.3.2` 冻结包；升级前保留 profile 与插件状态备份，旧版不继承 v2 的忽略/收起偏好。
 
 ## 功能
 
