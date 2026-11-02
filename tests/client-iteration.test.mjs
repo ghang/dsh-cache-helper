@@ -228,16 +228,42 @@ test('browser iteration: a new or changed risk reopens the shared dialog while e
   assert.deepEqual(errors, []);
 });
 
-test('browser iteration: main and child risks share one modal and keep the main compaction action', async t => {
-  const main = { ...pending(0), sessionId: 'main', role: 'main', identity: { role: 'main' } };
-  const stub = harness({ pending: [main, pending(1)] });
-  const { page, errors } = await fixture(t, { api: stub.api, globalPending: true, composerSessionId: 'main' });
+test('browser iteration: each concurrent risk identifies its project and ignoring one session leaves the other waiting', async t => {
+  const main = { ...pending(0), sessionId: 'main', role: 'main', identity: { role: 'main' },
+    title: 'Main investigation', cwd: '/synthetic/project-red', project: 'project-red' };
+  const child = { ...pending(1), title: 'Child investigation', cwd: 'C:\\projects\\project-blue', project: 'project-blue' };
+  const stub = harness({ pending: [main, child] });
+  const { page, requests, errors } = await fixture(t, { api: stub.api, globalPending: true, composerSessionId: 'main' });
   const dialog = page.getByRole('alertdialog', { name: '缓存可能大规模失效', exact: true });
   await dialog.waitFor();
   assert.equal(await page.getByRole('alertdialog').count(), 1);
-  await dialog.getByRole('article', { name: '会话 main 等待缓存确认', exact: true }).getByRole('button', { name: '生成精简副本', exact: true }).click();
-  await page.getByRole('dialog', { name: '生成精简副本', exact: true }).waitFor();
-  assert.equal(await page.getByRole('alertdialog').count(), 0);
+  const target = dialog.getByRole('article', { name: '会话 main 等待缓存确认', exact: true });
+  assert.match(await target.innerText(), /Main investigation[\s\S]*project-red[\s\S]*会话 ID：main/);
+  assert.match(await dialog.innerText(), /Child investigation[\s\S]*C:\\projects\\project-blue/);
+  assert.equal(await dialog.getByRole('button', { name: '生成精简副本', exact: true }).count(), 0);
+  await target.getByRole('button', { name: '忽略该会话', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('[aria-label="会话 main 等待缓存确认"]'));
+  assert.deepEqual(stub.state.pending.map(item => item.sessionId), ['child-1']);
+  assert.deepEqual(requests.filter(item => item.path.endsWith('/decision')).at(-1).body,
+    { sessionId: 'main', id: main.id, fingerprint: main.fingerprint, decision: 'ignore' });
+  await page.setViewportSize({ width: 360, height: 900 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), true);
+  assert.deepEqual(errors, []);
+});
+
+test('browser iteration: a single main risk shows its full target and can ignore its session directly', async t => {
+  const main = { ...pending(0), sessionId: 'main', role: 'main', identity: { role: 'main' },
+    title: 'Image investigation', cwd: '/synthetic/project-red', project: 'project-red' };
+  const stub = harness({ pending: [main] });
+  const { page, requests, errors } = await fixture(t, { api: stub.api, globalPending: true });
+  const dialog = page.getByRole('alertdialog', { name: '缓存可能大规模失效', exact: true });
+  await dialog.waitFor();
+  const target = dialog.getByLabel('风险请求所属会话', { exact: true });
+  assert.match(await target.innerText(), /会话：Image investigation[\s\S]*项目：project-red[\s\S]*目录：\/synthetic\/project-red[\s\S]*会话 ID：main/);
+  await dialog.getByRole('button', { name: '忽略该会话', exact: true }).click();
+  await dialog.waitFor({ state: 'detached' });
+  assert.equal(stub.state.pending.length, 0);
+  assert.equal(requests.filter(item => item.path.endsWith('/decision')).at(-1).body.decision, 'ignore');
   assert.deepEqual(errors, []);
 });
 

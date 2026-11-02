@@ -74,7 +74,9 @@ export function compareRequests(previousRequest, currentRequest, config = {}) {
   };
   const changes = changesBetween(previous, current);
   const routeChanged = previous.provider !== current.provider || previous.model !== current.model;
-  const commonChars = routeChanged ? 0 : commonPrefixLength(previous.text, current.text);
+  const prefix = routeChanged ? 0 : commonPrefixLength(previous.text, current.text);
+  const commonChars = Math.min(previous.chars, prefix + (previous.weightedSpans ?? []).filter(span => span.end <= prefix)
+    .reduce((sum, span) => sum + span.extra, 0));
   const lossRatio = previous.chars > 0 ? 1 - commonChars / previous.chars : 0;
   const lossTokens = promptTokens === null ? null : Math.round(promptTokens * lossRatio);
   if (lossRatio === 0) {
@@ -130,7 +132,7 @@ export function inspectNextRequest(records, options, config = {}) {
   };
 }
 
-export const ANALYZER_VERSION = 'p1-facts-v2';
+export const ANALYZER_VERSION = 'p1-facts-v3';
 export const FACTS_SCHEMA_VERSION = 2;
 const sha = value => createHash('sha256').update(value).digest('hex');
 
@@ -139,7 +141,7 @@ function inputProof(input) {
     provider: input.provider ?? null, model: input.model ?? null };
   const history = historyText(input);
   return { comparable: true, provider: input.provider ?? null, model: input.model ?? null,
-    chars: input.chars, textHash: sha(input.text), historyChars: history.length, historyHash: sha(history),
+    chars: input.chars, textChars: input.text.length, textHash: sha(input.text), historyChars: history.length, historyHash: sha(history),
     systemHash: sha(JSON.stringify(input.system)), fingerprint: input.fingerprint,
     // Too many declarations force a clear miss instead of unbounded retention.
     toolHashes: input.tools.length <= 128 && input.tools.every(tool => typeof tool.name === 'string' && tool.name.length <= 256) ? input.tools.map(tool => ({ name: tool.name,
@@ -178,7 +180,7 @@ function compareProof(proof, current, promptTokens) {
   const changes = proofChanges(proof, current);
   if (!changes) return null;
   const routeChanged = proof.provider !== (current.provider ?? null) || proof.model !== (current.model ?? null);
-  if (!routeChanged && (current.chars < proof.chars || sha(current.text.slice(0, proof.chars)) !== proof.textHash)) return null;
+  if (!routeChanged && (current.chars < proof.chars || sha(current.text.slice(0, proof.textChars)) !== proof.textHash)) return null;
   const lossRatio = routeChanged && proof.chars > 0 ? 1 : 0;
   const lossTokens = promptTokens === null ? null : Math.round(promptTokens * lossRatio);
   if (lossRatio === 0) for (const change of changes) change.preservesPrefix = true;

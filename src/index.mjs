@@ -73,6 +73,17 @@ function riskView(risk) {
   return result;
 }
 
+function targetView(session, records) {
+  let title = null;
+  for (let index = records.length - 1; index > 0; index--) {
+    if (records[index].type === 'session/title' && typeof records[index].data?.title === 'string') {
+      title = records[index].data.title.slice(0, 4096); break;
+    }
+  }
+  const cwd = typeof session.header.cwd === 'string' ? session.header.cwd.slice(0, 4096) : null;
+  return { title, cwd, project: cwd?.split(/[\\/]/).filter(Boolean).at(-1) ?? null };
+}
+
 async function bodyOf(req) {
   if (!String(req.headers['content-type'] ?? '').startsWith('application/json')) {
     throw Object.assign(new Error('需要 application/json。'), { status: 415 });
@@ -118,8 +129,33 @@ export async function createCacheHelper(ctx, userConfig = {}) {
   repository.operations = () => operations.list();
   const disposers = [];
   let disposed = false;
+  let ignoreWrite = Promise.resolve();
   const api = {
     gate, repository, policy, operations, children, catalog, jobs,
+    setIgnored: data => {
+      const operation = ignoreWrite.catch(() => {}).then(async () => {
+        if (!data || typeof data.ignored !== 'boolean') throw new GateError('无效的会话忽略设置。', 'CACHE_HELPER_BAD_DECISION');
+        if (disposed) throw new GateError('缓存插件已卸载，请重新发送。');
+        if (data.ignored) await catalog.assertVisible([data.sessionId]);
+        const pending = gate.pendingFor(data.sessionId);
+        if (data.ignored && (pending || data.id !== undefined)) gate.check(data);
+        const previous = repository.isIgnored(data.sessionId);
+        await repository.setIgnored(data.sessionId, data.ignored);
+        if (data.ignored) {
+          try {
+            if (disposed) throw new GateError('缓存插件已卸载，请重新发送。');
+            if (pending) gate.decide({ ...data, decision: 'confirm' });
+            else if (gate.pendingFor(data.sessionId)) throw new GateError('保存期间出现新的待确认请求，请在弹窗中重新选择。', 'CACHE_HELPER_STALE');
+          }
+          catch (error) { await repository.setIgnored(data.sessionId, previous); throw error; }
+        }
+        return { ok: true, sessionId: data.sessionId, ignored: data.ignored };
+      });
+      ignoreWrite = operation;
+      return operation;
+    },
+    decide: data => data?.decision === 'ignore'
+      ? api.setIgnored({ ...data, ignored: true }) : gate.decide(data ?? {}),
     updateResolvedConfig: next => {
       const resolved = configOf(next);
       const snapshot = policy.updateResolvedConfig(resolved);
@@ -131,7 +167,7 @@ export async function createCacheHelper(ctx, userConfig = {}) {
       try {
         const metrics = options.cached ? await repository.cachedSession?.(sessionId, options) : await repository.session(sessionId, options);
         if (options.cached && !metrics) return null;
-        return { ...metrics, sessionId, pending: gate.pendingFor(sessionId), childrenPending: gate.list({ sessionId }).filter(item => item.sessionId !== sessionId),
+        return { ...metrics, sessionId, ignored: repository.isIgnored(sessionId), pending: gate.pendingFor(sessionId), childrenPending: gate.list({ sessionId }).filter(item => item.sessionId !== sessionId),
           childObservation: children.observations({ sessionId }), operation: operations.forSession(sessionId) };
       }
       catch (error) {
@@ -140,7 +176,7 @@ export async function createCacheHelper(ctx, userConfig = {}) {
         if (!pending && !childrenPending.length) throw error;
         // A failed analysis must not hide the very confirmation waiting on it.
         return {
-          sessionId, title: sessionId, latest: null, cumulative: null,
+          sessionId, title: sessionId, ignored: repository.isIgnored(sessionId), latest: null, cumulative: null,
           calls: [], turns: [], warnings: [], pending, childrenPending,
           config: { minLostTokens: config.minLostTokens, minLossRatio: config.minLossRatio },
           coverage: { unknown: true, errors: [{ message: '当前会话的用量分析不可用；发送前检查仍在等待确认。' }] },
@@ -157,6 +193,7 @@ export async function createCacheHelper(ctx, userConfig = {}) {
       if (disposed) return;
       disposed = true;
       gate.dispose();
+      await ignoreWrite.catch(() => {});
       await children.dispose();
       await jobs.dispose();
       await operations.dispose();
@@ -169,7 +206,7 @@ export async function createCacheHelper(ctx, userConfig = {}) {
     if (disposed) throw new GateError('缓存插件已卸载，请重新发送。');
     const strategy = policy.snapshot();
     const requestConfig = { ...config, ...strategy.values };
-    if (isAgentLoopRequest(options) && !options.purpose) {
+    if (isAgentLoopRequest(options) && !options.purpose && !repository.isIgnored(options.sessionId)) {
       const session = ctx.sessions.get(options.sessionId);
       if (!session) throw new GateError('缓存检查无法读取当前会话，已阻止发送。', 'CACHE_HELPER_SESSION_UNAVAILABLE');
       {
@@ -207,6 +244,7 @@ export async function createCacheHelper(ctx, userConfig = {}) {
           }
         }
         risk = riskView(risk);
+        if (repository.isIgnored(session.id)) risk = null;
         if (child) children.observe(session.id, { identity, baseline, sourceCut,
           state: risk ? config.childProtection === 'block' ? 'risk' : 'observed-risk' : baseline.kind === 'none' ? 'first-request' : 'checked',
           ...(risk ? { risk } : {}) });
@@ -238,7 +276,7 @@ export async function createCacheHelper(ctx, userConfig = {}) {
               && nextBaseline.inheritedEventCount === baseline.inheritedEventCount
               && (!child || children.matches(session.id, runtimeIdentity.activationGeneration, session));
           };
-          await gate.wait({ ...risk, policy: strategy, identity, baseline, sourceCut,
+          await gate.wait({ ...risk, ...targetView(session, records), policy: strategy, identity, baseline, sourceCut,
             ...(child && baseline.kind === 'inherited' ? { reason: '继承前缀复用风险：请确认此子任务的本次发送。' } : {}) }, {
             sessionId: session.id, fingerprint: candidateFingerprint, turn, step, signal: options.signal,
             validate: valid, observe: observed,
@@ -328,7 +366,13 @@ export async function createCacheHelper(ctx, userConfig = {}) {
         }
         if (req.method === 'POST' && path === '/dsh-cache-helper/api/decision') {
           const data = await bodyOf(req);
-          return json(res, 200, gate.decide(data));
+          return json(res, 200, await api.decide(data));
+        }
+        if (req.method === 'GET' && path === '/dsh-cache-helper/api/sessions/ignored') {
+          return json(res, 200, { sessionIds: repository.ignoredSessions() });
+        }
+        if (req.method === 'POST' && path === '/dsh-cache-helper/api/sessions/ignored') {
+          return json(res, 200, await api.setIgnored(await bodyOf(req)));
         }
         if (req.method === 'POST' && path === '/dsh-cache-helper/api/warnings/dismiss') {
           return json(res, 200, await repository.dismiss(await bodyOf(req)));

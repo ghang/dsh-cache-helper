@@ -75,7 +75,7 @@ node scripts/replay-session.mjs /absolute/path/session.v4.jsonl.zstd
 - `inputTokens`、`cacheReadTokens`、`cacheWriteTokens` 是互不重叠的计数。缺失字段保留未知，不补为零。
 - 未实际发送的空流取消不覆盖已知读数；实际末次回执缺少 usage 时保持未知，不沿用此前值。
 - 门禁绑定同一会话、候选指纹和历史版本，明确确认后只放行一次；停止、卸载或确认过期均不能发送。
-- 插件不注册模型工具、注入提示词、读取凭据或自动调用模型做原因分析。界面中的“生成精简副本”使用既有分支压缩机制；只有用户明确点击“创建副本并生成摘要”才调用宿主摘要服务并记录实际用量。生成过程中可“取消生成”，结果页可“打开副本，手动继续”，不自动续发主任务。
+- 插件不注册模型工具、注入提示词、读取凭据或自动调用模型。精简副本 UI 已移除；受控操作服务与历史恢复元数据保留。显式忽略按准确会话持久化，必须先保存成功并校验当前候选，再继续其请求。
 
 ## 数据接口语义
 
@@ -87,7 +87,7 @@ node scripts/replay-session.mjs /absolute/path/session.v4.jsonl.zstd
 
 `FactCache` 保存经严格 schema/校验和校验的中性事实，不保存正文、完整工具定义或 replay。跨重启以 header 生命周期、继承切点、事件前缀摘要、分析器/适配器和稳定依赖签名验证，绝不比较旧进程 revision。正常追加用语义前缀 hash 证明旧输入未变，只规范化新调用；前缀不符时只重建必要基线并记录 `prefix-proof-mismatch`，不以粗化比较改变阈值。自定义 message projection 没有可证明的稳定语义版本时，跨重启明确 `unknown-dependency` miss。
 
-单条 4 MiB、总量 32 MiB/128 条/14 天闲置预算、owner-only/NOfollow、原子替换、过期/损坏清理和清理 epoch 防止旧计算回写。预算衡量序列化事实，不是进程 heap 硬限；取消/失败不发布半成品，磁盘失败不影响 Session 真源。`cacheHelperAccounting` 是有版本、严格 schema 的有界宿主投影，只有计数、已知用量和末个有效回执；冷分析以公开 `sessionProjectionCache.coldSnapshot` 写回派生 checkpoint，live 只物化投影，不主动 flush Session。只列目录用 `cachedSnapshot`，不补读正文。详细事实淘汰后可展示带水位的 summary-only DTO，`latest/cumulative` 保持 null，`calls/warnings` 为空并明确细节未覆盖，不伪造精确百分比或无异常。
+单条 4 MiB、总量 32 MiB/128 条/14 天闲置预算、非 Windows owner-only/NOfollow、原子替换、过期/损坏清理和清理 epoch 防止旧计算回写。预算衡量序列化事实，不是进程 heap 硬限；取消/失败不发布半成品，磁盘失败不影响 Session 真源。`cacheHelperAccounting` 是有版本、严格 schema 的有界宿主投影，只有计数、已知用量和末个有效回执；冷分析以公开 `sessionProjectionCache.coldSnapshot` 写回派生 checkpoint，live 只物化投影，不主动 flush Session。只列目录用 `cachedSnapshot`，不补读正文。详细事实淘汰后可展示带水位的 summary-only DTO，`latest/cumulative` 保持 null，`calls/warnings` 为空并明确细节未覆盖，不伪造精确百分比或无异常。
 
 `SessionCatalog` 从 live-preferred header/缓存投影读取轻目录，默认有界 10,000 条、4 个 2 分钟稳定快照，对稳定快照分页；公共 list 本身不物理分页。目录与显式 IDs 都经过相同当前可见性检查，浏览器 HTTP admission 仍仅接受 owner browserPeer。选择预览固定展开集，执行传入同 snapshotId 和明确 IDs，过期拒绝重建；人工 fork 不当作 subagent 子树。
 
@@ -130,7 +130,9 @@ web 接口使用 DSH 现有浏览器认证，模型或 API operator 不能代替
 | `POST /dsh-cache-helper/api/pending/reachable` | `{channelId,seq,reachable}`，仅浏览器可见确认组件发心跳 |
 | `POST /dsh-cache-helper/api/children/stop` | `{sessionId,parentSessionId,activationGeneration,id,fingerprint}`，有界停止观察 |
 | `GET /dsh-cache-helper/api/dashboard` | `period=7d|30d|all`，可带 `model` / `provider`；返回有扫描上限的会话概要、专项统计、图表分布及覆盖范围；当前看板不展示分析建议 |
-| `POST /dsh-cache-helper/api/decision` | `{sessionId, id, fingerprint, decision}`；`decision` 只接受 `confirm` 或 `cancel`，旧确认返回失效状态 |
+| `POST /dsh-cache-helper/api/decision` | `{sessionId, id, fingerprint, decision}`；`decision` 接受 `confirm`、`cancel` 或 `ignore`；ignore 保存会话偏好并确认当前有效候选，旧确认返回失效状态 |
+| `GET /dsh-cache-helper/api/sessions/ignored` | `{sessionIds}`；只返回忽略检查的会话 ID |
+| `POST /dsh-cache-helper/api/sessions/ignored` | `{sessionId,ignored,id?,fingerprint?}`；当前有 pending 时忽略必须绑定同一候选，恢复不放行请求 |
 | `GET /dsh-cache-helper/api/operations/preview?sessionId=...` | 只读准备一次受控分支压缩候选，返回能力与来源快照 |
 | `GET /dsh-cache-helper/api/operations?id=...` | 查询当前操作、分支与脱敏摘要回执 |
 | `POST /dsh-cache-helper/api/operations/start` | `{sessionId, id}`；同候选幂等，明确开始分支压缩 |
@@ -139,15 +141,15 @@ web 接口使用 DSH 现有浏览器认证，模型或 API operator 不能代替
 
 dashboard 日期按记录时间：摘要存在明确 stream 开始回执时先按分支与 summary seq 合并，再进行日期筛选和去重；其他历史保留结算回执时间，来源与未知单列。相同调用不会因分支是否进入扫描而改变日期。
 
-web-state 文件只保存版本与告警收起 ID；分析事实和 job 恢复分别使用有预算的独立存储。浏览器的异常筛选只保存布尔值；受控操作单独保存脱敏恢复元数据与实际摘要回执，不保存正文或凭据。配置值通过宿主 ConfigForms/ConfigEditor 保存，插件不另建配置文档。
+web-state v2 文件只保存版本、告警收起 ID 和会话忽略 ID；读取兼容 v1，回滚旧版不保留 v2 的偏好；分析事实和 job 恢复分别使用有预算的独立存储。浏览器的异常筛选只保存布尔值；受控操作单独保存脱敏恢复元数据与实际摘要回执，不保存正文或凭据。配置值通过宿主 ConfigForms/ConfigEditor 保存，插件不另建配置文档。
 
 ## 修改后的最小回归
 
 | 修改面 | 必须核对 |
 |---|---|
 | 用量或分组 | 多轮、多步骤、末次未知、空流取消和加权累计 |
-| 请求重建或投影 | 生产适配器与假上游 wire 差分、system 更新、工具增删和 deferred 激活 |
-| 确认门禁 | 主/子、fork/spawn、冷续轮、缺回执、并发/嵌套、父等待、固定 deadline、steer、可达心跳、停止观察、浏览器身份；真实 native→HTTP→客户端→假上游闭环 |
+| 请求重建或投影 | 生产适配器与假上游 wire 差分、system 更新、工具增删、deferred 激活、附件同 ID/替换/缺 ID、base64 权重与增量证明 |
+| 确认门禁 | 忽略/恢复/重启/保存失败/准确候选隔离；主/子、fork/spawn、冷续轮、缺回执、并发/嵌套、父等待、固定 deadline、steer、可达心跳、停止观察、浏览器身份；真实 native→HTTP→客户端→假上游闭环 |
 | 分析缓存 | 重启/append/policy 零旧 normalize、unknown 依赖与前缀 mismatch、同 ID/截短/损坏/权限/预算、并发清理和新旧结果、水位/summary-only 覆盖 |
 | 主动分析 | 超过 50 目录、无正文列表、scope/分页/固定展开、reuse/refresh、当前读取预算、取消共享消费者、部分失败、重连/重启中断与幂等 |
 | 热配置 | 真实保存与重启、无效配置、并发 revision 冲突、草稿保留、unset 继承默认、旧 pending 策略冻结 |

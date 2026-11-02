@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 import { loadRuntime } from '../scripts/verify-runtime.mjs';
 import { createFakeUpstream } from './fake-upstream.mjs';
 const testedModule = file => process.env.DSH_CACHE_HELPER_TEST_ARTIFACT
@@ -46,7 +47,7 @@ function registerTool(ctx, name, deferLoading = false) {
   }));
 }
 
-async function harness(t, { script = [], helper = true, model = MODEL, config = {} } = {}) {
+async function harness(t, { script = [], helper = true, model = MODEL, config = {}, attachments } = {}) {
   const upstream = await createFakeUpstream({ script });
   const ctx = new Context();
   let cacheHelper;
@@ -65,7 +66,8 @@ async function harness(t, { script = [], helper = true, model = MODEL, config = 
     options: () => resolveAdapterOptions({ baseURL: upstream.url, retryPolicy: { mode: 'normal', maxRetries: 0 } }),
     resolveAuth: async () => ({ headers: { 'x-api-key': 'synthetic-key-only' } }),
     resolveUserId: () => 'cache-helper-synthetic-validation',
-    resolveAttachments: () => undefined,
+    resolveAttachments: () => attachments,
+    ...(attachments ? { resolveFiles: () => ({ async ensureUploaded() { throw new Error('Synthetic Files outage selects inline serialization'); } }) } : {}),
     prepareExtensions: async () => ({ fields: {}, accept: async () => {} }),
   }));
   if (helper) cacheHelper = await createCacheHelper(ctx, { registerHttp: false, persistState: false, minLostTokens: 1, minLossRatio: 0.01, ...config });
@@ -124,6 +126,102 @@ test('native AgentLoop + DeepSeek HTTP: confirmation is required and consumed ex
   assert.equal(h.helper.gate.pendingFor(view.sessionId), null);
   assert.equal(h.upstream.requests[1].headers['x-api-key'], 'synthetic-key-only');
   assert.equal(h.upstream.requests[1].path, '/anthropic/v1/messages');
+});
+
+test('native AgentLoop + DeepSeek HTTP: ignore identifies its project, continues once, bypasses later checks and can be restored', async t => {
+  const h = await harness(t, { script: Array.from({ length: 5 }, () => ({ text: 'synthetic reply' })) });
+  const removeA = registerTool(h.ctx, 'a_probe');
+  const removeZ = registerTool(h.ctx, 'z_probe');
+  const agent = await h.agent('ignore-target', { cwd: '/synthetic/project-red' });
+  agent.session.append('session/title', { title: 'Attachment investigation' });
+  const other = await h.agent('other-protected', { cwd: '/synthetic/project-blue' });
+  await send(agent, 'first'); await send(other, 'first');
+  removeA();
+  agent.followup(user('request needing a decision'));
+  const view = await pending(h.helper, agent);
+  assert.equal(view.project, 'project-red');
+  assert.equal(view.cwd, '/synthetic/project-red');
+  assert.equal(view.title, 'Attachment investigation');
+  await assert.rejects(h.helper.decide({ ...view, fingerprint: 'stale', decision: 'ignore' }), { code: 'CACHE_HELPER_STALE' });
+  assert.equal(h.helper.repository.isIgnored(agent.session.id), false);
+  await h.helper.decide({ ...view, decision: 'ignore' });
+  await agent.whenIdle();
+  assert.equal(h.upstream.requests.length, 3);
+  assert.equal(h.helper.repository.isIgnored(agent.session.id), true);
+  other.followup(user('other session stays protected'));
+  const otherView = await pending(h.helper, other);
+  assert.equal(otherView.project, 'project-blue');
+  assert.equal(h.helper.repository.isIgnored(other.session.id), false);
+  decide(h.helper, otherView, 'cancel'); await other.whenIdle();
+  removeZ();
+  const removeRestored = registerTool(h.ctx, 'new_head_tool');
+  await send(agent, 'ignored session must proceed without another prompt');
+  assert.equal(h.upstream.requests.length, 4);
+  assert.equal(h.helper.gate.pendingFor(agent.session.id), null);
+  await h.helper.setIgnored({ sessionId: agent.session.id, ignored: false });
+  removeRestored();
+  agent.followup(user('restored session checks this changed prefix'));
+  const restored = await pending(h.helper, agent);
+  decide(h.helper, restored, 'confirm'); await agent.whenIdle();
+  assert.equal(h.upstream.requests.length, 5);
+});
+
+test('native AgentLoop + DeepSeek HTTP: a failed ignore save never authorizes the pending request', async t => {
+  const h = await harness(t, { script: [{ text: 'first' }] });
+  const remove = registerTool(h.ctx, 'a_probe'); registerTool(h.ctx, 'z_probe');
+  const agent = await h.agent('ignore-save-failure');
+  await send(agent, 'first'); remove(); agent.followup(user('wait'));
+  const view = await pending(h.helper, agent);
+  t.mock.method(h.helper.repository, 'setIgnored', async () => { throw new Error('synthetic disk failure'); });
+  await assert.rejects(h.helper.decide({ ...view, decision: 'ignore' }), /synthetic disk failure/);
+  assert.equal(h.helper.repository.isIgnored(agent.session.id), false);
+  assert.equal(h.helper.gate.pendingFor(agent.session.id).id, view.id);
+  await assertNoExtraRequest(h.upstream, 1);
+  decide(h.helper, view, 'cancel'); await agent.whenIdle();
+});
+
+test('native AgentLoop + DeepSeek HTTP: an ignore saved during a candidate change rolls back without dispatch', async t => {
+  const h = await harness(t, { script: [{ text: 'first' }] });
+  const remove = registerTool(h.ctx, 'a_probe'); registerTool(h.ctx, 'z_probe');
+  const agent = await h.agent('ignore-stale-save');
+  await send(agent, 'first'); remove(); agent.followup(user('wait'));
+  const view = await pending(h.helper, agent);
+  const original = h.helper.repository.setIgnored.bind(h.helper.repository);
+  t.mock.method(h.helper.repository, 'setIgnored', async (id, ignored) => {
+    await original(id, ignored);
+    if (ignored) agent.session.append('user/message', user('new source while saving'), { surfaceOp: 'append' });
+  });
+  await assert.rejects(h.helper.decide({ ...view, decision: 'ignore' }), { code: 'CACHE_HELPER_STALE' });
+  await agent.whenIdle();
+  assert.equal(h.helper.repository.isIgnored(agent.session.id), false);
+  await assertNoExtraRequest(h.upstream, 1);
+});
+
+test('native AgentLoop + DeepSeek HTTP: an image history continues without repeated confirmation and matches adapter serialization size', async t => {
+  const data = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==', 'base64');
+  const attachment = { attachmentId: `sha256:${createHash('sha256').update(data).digest('hex')}`,
+    mediaType: 'image/png', bytes: data.length, width: 1, height: 1, name: 'synthetic.png' };
+  const attachments = { async readImageRequest(ref) { return { attachment: ref, variantId: ref.attachmentId,
+    data, bytes: data.length, mediaType: ref.mediaType, width: 1, height: 1, depth: 'uchar', space: 'srgb', hasAlpha: true }; } };
+  const h = await harness(t, { attachments, script: [{ text: 'first image reply' }, { text: 'normal continuation' }] });
+  const agent = await h.agent('native-image-prefix');
+  agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'image', attachment }] }));
+  await agent.whenIdle();
+  assert.equal(h.upstream.requests.length, 1);
+  const calls = reconstructCalls([{ type: 'session', ...agent.session.header }, ...agent.session.snapshotEvents()]);
+  const normalized = normalizeRequest(calls[0].request);
+  const wire = h.upstream.requests[0].body;
+  const projected = structuredClone(wire.messages);
+  const image = projected.flatMap(message => message.content).find(block => block.type === 'image');
+  assert.equal(image.source.data, data.toString('base64'));
+  image.source.data = `${attachment.attachmentId}:${attachment.bytes}`;
+  assert.deepEqual(normalized.messages, projected);
+  const actualText = `tools:${JSON.stringify(wire.tools ?? [])}\nsystem:${JSON.stringify(wire.system ?? '')}\n`
+    + wire.messages.map(message => `role:${message.role}\n` + message.content.map(block => `${JSON.stringify(block)}\n`).join('')).join('');
+  assert.equal(normalized.chars, actualText.length);
+  await send(agent, 'Continue with the same image in history');
+  assert.equal(h.upstream.requests.length, 2);
+  assert.equal(h.helper.gate.pendingFor(agent.session.id), null);
 });
 
 test('native AgentLoop + DeepSeek HTTP: a tool change gates the next step inside the same turn', async t => {
@@ -327,7 +425,7 @@ test('warning recovery, dashboard metrics and dismissal survive helper reload wi
   assert.equal(metrics.warnings[0].dismissed, false);
   await h.helper.repository.dismiss({ sessionId: agent.session.header.id, id: metrics.warnings[0].id, dismissed: true });
   const state = JSON.parse(await readFile(statePath, 'utf8'));
-  assert.deepEqual(state, { version: 1, dismissed: [`${agent.session.header.id}:${metrics.warnings[0].id}`] });
+  assert.deepEqual(state, { version: 2, dismissed: [`${agent.session.header.id}:${metrics.warnings[0].id}`], ignoredSessions: [] });
   const dashboard = await h.helper.dashboard();
   assert.equal(dashboard.coverage.included, 1);
   assert.equal(dashboard.sessions[0].latest.cacheReadTokens, 120_000);

@@ -73,6 +73,33 @@ async function browserHarness(t, options = {}) {
   return { ...h, page, context, errors, requests };
 }
 
+test('native child → real HTTP → actual UI ignores exactly its session while a sibling stays protected', async t => {
+  const h = await browserHarness(t);
+  h.remove();
+  const activation = await h.start('browser-ignore-child');
+  await eventually(() => h.helper.gate.pendingFor(activation.childId), 'Expected native ignored child pending');
+  const queue = h.page.getByRole('alertdialog', { name: '缓存可能大规模失效', exact: true });
+  const row = queue.getByRole('article', { name: `子任务 ${activation.childId} 等待缓存确认` });
+  await row.waitFor();
+  assert.match(await row.innerText(), /项目：synthetic[\s\S]*目录：\/synthetic/);
+  assert.equal(h.upstream.requests.length, 1);
+  await row.getByRole('button', { name: '忽略该会话', exact: true }).click();
+  await activation.result;
+  assert.equal(h.upstream.requests.length, 2);
+  assert.equal(h.helper.repository.isIgnored(activation.childId), true);
+  assert.equal(h.helper.repository.isIgnored(h.parent.id), false);
+  const sibling = await h.start('browser-still-protected');
+  const pending = await eventually(() => h.helper.gate.pendingFor(sibling.childId), 'Expected independent sibling confirmation');
+  assert.equal((await h.request('POST', '/decision', { ...pending, decision: 'ignore' }, { operator: true })).status, 403);
+  assert.equal((await h.request('POST', '/sessions/ignored', { sessionId: sibling.childId, ignored: true }, { operator: true })).status, 403);
+  assert.equal(h.helper.repository.isIgnored(sibling.childId), false);
+  h.helper.gate.decide({ ...pending, decision: 'cancel' }); await sibling.result;
+  const restored = await h.request('POST', '/sessions/ignored', { sessionId: activation.childId, ignored: false });
+  assert.equal(restored.status, 200);
+  assert.equal(h.helper.repository.isIgnored(activation.childId), false);
+  assert.deepEqual(h.errors, []);
+});
+
 test('native child → real HTTP → actual parent/global UI confirms once and cancels a separate child', async t => {
   const h = await browserHarness(t);
   h.remove();

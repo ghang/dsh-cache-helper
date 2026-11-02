@@ -1,6 +1,6 @@
 import { Session } from '@deepseek-ai/dsh-session';
 import { SurfaceManager } from '@deepseek-ai/dsh-session/surface';
-import { lastAssistantStreamChunk, projectToolUpdates } from '@deepseek-ai/dsh-llm';
+import { lastAssistantStreamChunk, projectToolUpdates, fileHandleText, requestImageHandleText, offloadedImageText } from '@deepseek-ai/dsh-llm';
 import { createHash } from 'node:crypto';
 import { inheritanceCut, sessionIdentity } from './session-identity.mjs';
 
@@ -274,10 +274,38 @@ function replaySignatures(message, model) {
   return state.response.model === model ? state.blocks : [];
 }
 
-function wireInput(blocks) {
+// The host owns attachment bytes and execution-world paths. Compare immutable
+// content identities, never read the files or retain their base64 payloads.
+function attachmentInput(block, weights) {
+  const ref = block.attachment;
+  if (!ref || typeof ref.attachmentId !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(ref.attachmentId)
+    || !Number.isSafeInteger(ref.bytes) || ref.bytes < 0
+    || ref.name !== undefined && typeof ref.name !== 'string') {
+    throw new Error(`${block.type} 附件缺少有效 attachmentId 或大小，无法可靠比较`);
+  }
+  if (block.type === 'file') {
+    // Files are handle text, not inline file bytes. Keep the full digest so
+    // attachments sharing the displayed eight-character prefix stay distinct.
+    return [{ type: 'text', text: fileHandleText(ref, undefined)
+      .replace(`sha256:${ref.attachmentId.slice(7, 15)}`, ref.attachmentId) }];
+  }
+  if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(ref.mediaType)
+    || ![ref.width, ref.height].every(value => Number.isSafeInteger(value) && value > 0)
+    || ref.bytes > 32 * 1024 * 1024) throw new Error('image 附件元数据不完整或超过适配器上限');
+  if (block.offloaded === true) return [{ type: 'text', text: offloadedImageText(ref) }];
+  const source = { type: 'base64', media_type: ref.mediaType, data: `${ref.attachmentId}:${ref.bytes}` };
+  // Mirror the adapter's handle + base64 image shape. Virtual character weight
+  // avoids allocating tens of MiB of dummy base64 per image. Request transforms,
+  // offload and Files API transport remain estimates, like text/token scaling.
+  weights.set(source, 4 * Math.ceil(ref.bytes / 3) - source.data.length);
+  return [{ type: 'text', text: requestImageHandleText(ref, ref) }, { type: 'image', source }];
+}
+
+function wireInput(blocks, weights) {
   const result = [];
   for (const block of blocks) {
     if (block.type === 'text') { if (block.text) result.push({ type: 'text', text: block.text }); }
+    else if (block.type === 'image' || block.type === 'file') result.push(...attachmentInput(block, weights));
     else if (!['reasoning', 'tool-call'].includes(block.type)) {
       throw new Error(`不支持可靠比较的输入内容：${block.type}（附件/文件需适配器投影）`);
     }
@@ -286,7 +314,7 @@ function wireInput(blocks) {
 }
 
 /** Semantic input of the checked DeepSeek Messages adapter, without trace IDs. */
-function deepseekInput(request, projected, mode) {
+function deepseekInput(request, projected, mode, weights) {
   let system;
   const messages = [];
   const pendingSystem = [];
@@ -330,8 +358,8 @@ function deepseekInput(request, projected, mode) {
       });
     } else if (message.role === 'tool') {
       content = [{ type: 'tool_result', tool_use_id: message.toolCallId,
-        content: wireInput(message.content), ...(message.isError === undefined ? {} : { is_error: message.isError }) }];
-    } else if (message.role === 'user') content = wireInput(message.content);
+        content: wireInput(message.content, weights), ...(message.isError === undefined ? {} : { is_error: message.isError }) }];
+    } else if (message.role === 'user') content = wireInput(message.content, weights);
     else throw new Error(`未知消息角色：${message.role}`);
     if (!content.length && ['user', 'assistant'].includes(message.role)) continue;
     if (message.role === 'assistant') flush();
@@ -366,7 +394,8 @@ export function normalizeRequest(request, config = {}) {
     const mode = capabilities(request, config);
     if (mode.comparisonMode !== 'deepseek-messages') throw new Error('当前模型的适配器输入投影尚未覆盖');
     const projected = projectToolUpdates(request.messages ?? [], request.tools, mode.toolUpdate, request.toolHistory);
-    const input = deepseekInput(request, projected, mode);
+    const weights = new WeakMap();
+    const input = deepseekInput(request, projected, mode, weights);
     // No closing message/array markers after the history: ordinary appended
     // blocks and messages keep the previous complete semantic prefix intact.
     // A deferred declaration is model-visible only at its activation block.
@@ -374,13 +403,27 @@ export function normalizeRequest(request, config = {}) {
     // new deferred tool can be appended without destroying the old prefix.
     const deferred = new Map(input.tools.filter(tool => tool.defer_loading).map(tool => [tool.name, tool]));
     const sequence = [`tools:${JSON.stringify(input.tools.filter(tool => !tool.defer_loading))}\n`, `system:${JSON.stringify(input.system)}\n`];
+    const weightedSpans = [];
+    let offset = sequence.join('').length;
     for (const message of input.messages) {
-      sequence.push(`role:${message.role}\n`);
+      const role = `role:${message.role}\n`;
+      sequence.push(role); offset += role.length;
       for (const block of message.content) {
         if (block.type === 'tool_addition' && deferred.has(block.tool.name)) {
-          sequence.push(`deferred-tool:${JSON.stringify(deferred.get(block.tool.name))}\n`);
+          const declaration = `deferred-tool:${JSON.stringify(deferred.get(block.tool.name))}\n`;
+          sequence.push(declaration); offset += declaration.length;
         }
-        sequence.push(`${JSON.stringify(block)}\n`);
+        const serialized = `${JSON.stringify(block)}\n`;
+        let cursor = 0;
+        for (const part of block.type === 'tool_result' ? block.content : [block]) {
+          if (part.type !== 'image' || !weights.has(part.source)) continue;
+          const source = JSON.stringify(part.source);
+          const start = serialized.indexOf(source, cursor);
+          if (start < 0) throw new Error('附件投影位置不一致');
+          cursor = start + source.length;
+          weightedSpans.push({ end: offset + cursor - 1, extra: weights.get(part.source) });
+        }
+        sequence.push(serialized); offset += serialized.length;
       }
     }
     const text = sequence.join('');
@@ -388,7 +431,7 @@ export function normalizeRequest(request, config = {}) {
     return {
       comparable: true, provider: request.provider, model: request.model,
       tools: input.tools, system: input.system, messages: input.messages,
-      text, chars: text.length,
+      text, chars: text.length + weightedSpans.reduce((sum, span) => sum + span.extra, 0), weightedSpans,
       fingerprint: createHash('sha256').update(route).update(JSON.stringify(input)).digest('hex'),
       capabilities: mode,
     };

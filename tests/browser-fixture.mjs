@@ -50,7 +50,7 @@ export async function fixture(t, options = {}) {
   const preview = { id: 'operation-one', sessionId: 'main', state: 'prepared', available: true,
     route: { provider: 'synthetic-provider', model: 'synthetic-model' },
     input: { acceptedInHistory: true }, context: { beforeTokens: 100000, afterTokens: null }, summaryCalls: [] };
-  const state = { job: structuredClone(preview), startDelay: 100, statisticsReadTokens: options.statisticsReadTokens ?? 2700 };
+  const state = { job: structuredClone(preview), startDelay: 100, statisticsReadTokens: options.statisticsReadTokens ?? 2700, ignored: new Set() };
   const json = (response, value, status = 200) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(value)); };
   const server = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://localhost');
@@ -59,6 +59,14 @@ export async function fixture(t, options = {}) {
       if (request.method === 'POST') { let raw = ''; for await (const chunk of request) raw += chunk; body = JSON.parse(raw); }
       requests.push({ path: url.pathname, search: Object.fromEntries(url.searchParams), method: request.method, body });
       if (options.api && await options.api({ request, response, url, body, state, sessions, json, requests })) return;
+      if (url.pathname.endsWith('/sessions/ignored')) {
+        if (request.method === 'POST') {
+          body.ignored ? state.ignored.add(body.sessionId) : state.ignored.delete(body.sessionId);
+          if (sessions[body.sessionId]) sessions[body.sessionId].ignored = body.ignored;
+          return json(response, { ok: true, sessionId: body.sessionId, ignored: body.ignored });
+        }
+        return json(response, { sessionIds: [...state.ignored] });
+      }
       if (url.pathname.endsWith('/dashboard')) return json(response, {
         sessions: Object.values(sessions).map(item => ({ ...item, warningCount: item.sessionId === 'main' ? 2 : 1 })),
         generatedAt: NOW, policyVersion: 3, coverage: { scanned: 2, total: 20, limit: 2, limited: true, errors: [] },

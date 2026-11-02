@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readdir, readFile, writeFile, stat, symlink, mkdir } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, readFile, writeFile, stat, symlink, mkdir, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -56,9 +56,50 @@ test('disk restart validates the authoritative cut and reuses every old call wit
   const raw = await readFile(join(directory, 'cache', filename), 'utf8');
   assert.equal(raw.includes('PRIVATE_PROMPT_CANARY'), false);
   assert.equal(raw.includes('ordinary append'), false);
-  assert.equal((await stat(join(directory, 'cache'))).mode & 0o777, 0o700);
-  assert.equal((await stat(join(directory, 'cache', filename))).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(join(directory, 'cache'))).mode & 0o777, 0o700);
+    assert.equal((await stat(join(directory, 'cache', filename))).mode & 0o777, 0o600);
+  }
   await second.dispose();
+});
+
+test('Windows-style 0666 facts survive reads and restart; POSIX still rejects group/world access', async t => {
+  const { directory, make } = await environment(t);
+  const f = generated();
+  const cache = await make();
+  const service = new AnalysisService({ factCache: cache });
+  await service.analyze(request(f));
+  const file = join(directory, 'cache', (await readdir(cache.directory)).find(name => name.endsWith('.facts.json')));
+  await chmod(file, 0o666);
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  try {
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    assert.ok((await cache.get(f.session.id)).envelope, 'get must not delete Windows 0666 facts');
+    const restarted = await make();
+    assert.equal(restarted.summary().entries, 1, 'initialization must retain Windows facts');
+    assert.ok((await restarted.get(f.session.id)).envelope);
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    assert.equal((await restarted.get(f.session.id)).reason, 'corrupt-cache');
+    assert.equal((await readdir(cache.directory)).filter(name => name.endsWith('.facts.json')).length, 0);
+  } finally { Object.defineProperty(process, 'platform', descriptor); await service.dispose(); }
+});
+
+test('text-only adapter cache versions are discarded after attachment projection changes', async t => {
+  const { make } = await environment(t);
+  const cache = await make();
+  const f = generated();
+  const service = new AnalysisService({ factCache: cache });
+  await service.analyze(request(f));
+  const file = join(cache.directory, (await readdir(cache.directory)).find(name => name.endsWith('.facts.json')));
+  const old = JSON.parse(await readFile(file, 'utf8'));
+  old.adapterVersion = 'deepseek-messages-text-v1';
+  old.analyzerVersion = old.facts.analyzerVersion = 'p1-facts-v2';
+  old.factsSha256 = createHash('sha256').update(JSON.stringify(old.facts)).digest('hex');
+  await writeFile(file, JSON.stringify(old));
+  const restarted = await make();
+  assert.equal(restarted.summary().entries, 0);
+  assert.equal((await restarted.get(f.session.id)).reason, 'not-cached');
+  await service.dispose();
 });
 
 test('stable append reuses old pairs and normalizes only new calls, including after restart', async t => {

@@ -101,7 +101,7 @@ try {
     const { symlink } = await import('node:fs/promises');
     await symlink(join(root, 'node_modules'), join(packageRoot, 'node_modules'), 'dir');
     run(process.execPath, ['--input-type=module', '-e', 'const p=await import("./lib/index.mjs"); if(typeof p.createCacheHelper!=="function" || typeof p.apply!=="function") process.exit(1);'], { cwd: packageRoot, capture: true });
-    const artifactSuites = ['integration', 'operations', 'config-integration', 'client', 'client-next', 'client-iteration',
+    const artifactSuites = ['integration', 'attachments', 'operations', 'config-integration', 'client', 'client-next', 'client-iteration',
       'analysis-facts', 'analysis-service', 'session-identity', 'p0-review', 'fact-cache', 'accounting-projection',
       'session-catalog', 'analysis-jobs', 'child-control', 'child-gate', 'child-ui-integration', 'cache-review',
       'iteration-review', 'repository-cache'];

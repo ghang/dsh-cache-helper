@@ -236,70 +236,45 @@ test('browser next: retry warnings match the exact settlement while legacy recor
   assert.deepEqual(errors, []);
 });
 
-test('browser next: compaction is started once, survives closing, and waits for manual branch continuation', async t => {
+test('browser next: session ignore replaces compaction, survives remount, and restores from settings', async t => {
   const { page, requests, state, errors } = await fixture(t);
   await selectTab(page, '会话明细');
-  await page.getByRole('button', { name: '生成精简副本', exact: true }).click();
-  const dialog = page.getByRole('dialog', { name: '生成精简副本', exact: true });
-  await dialog.getByRole('button', { name: '创建副本并生成摘要', exact: true }).waitFor();
-  assert.equal(await dialog.getByRole('button', { name: '关闭精简副本结果', exact: true }).count(), 1);
-  const explanation = await dialog.innerText();
-  assert.match(explanation, /原会话/);
-  assert.match(explanation, /摘要/);
-  assert.match(explanation, /用量|费用/);
-  assert.match(explanation, /手动继续|先检查摘要，再决定是否继续/);
-  assert.equal(requests.filter(item => item.method === 'POST').length, 0, 'Reviewing the purpose and preview must not start a paid summary');
-  await dialog.getByRole('button', { name: '创建副本并生成摘要', exact: true }).evaluate(button => { button.click(); button.click(); });
-  await dialog.getByText('正在生成摘要', { exact: true }).waitFor();
-  assert.equal(requests.filter(item => item.path.endsWith('/operations/start')).length, 1);
-  await dialog.getByRole('button', { name: '关闭并保留状态', exact: true }).click();
-  assert.equal(await dialog.count(), 0);
-  const polls = requests.filter(item => item.path.endsWith('/operations')).length;
-  await page.waitForTimeout(650);
-  assert.equal(requests.filter(item => item.path.endsWith('/operations')).length, polls, 'Closed UI must stop polling without cancelling the operation');
-  assert.equal(requests.filter(item => item.path.endsWith('/operations/cancel')).length, 0);
-  await page.getByRole('button', { name: '生成精简副本', exact: true }).click();
-  await dialog.getByText('正在生成摘要', { exact: true }).waitFor();
-  assert.equal(requests.filter(item => item.path.endsWith('/operations/start')).length, 1, 'Reopening an active operation must not start it again');
-  const completedStatistics = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/dashboard'));
-  state.statisticsReadTokens = 3600;
-  state.job = { ...state.job, state: 'completed', context: { beforeTokens: 100000, afterTokens: 2000 },
-    summaryCalls: [
-      { provider: 'synthetic-provider', model: 'summary-model', usage: receipt, durationMs: 123,
-        source: 'llm-stream', llmStreamCall: true },
-      { provider: 'synthetic-provider', model: 'template-model', source: 'session-summary', llmStreamCall: false,
-        usageRecorded: false, usage: { inputTokens: null, cacheReadTokens: null }, durationMs: null },
-    ] };
-  await dialog.getByText('精简副本已就绪', { exact: true }).waitFor();
-  await dialog.getByText(/^摘要记录（模型调用未确认）：synthetic-provider \/ template-model/).waitFor();
-  assert.equal(await dialog.getByText(/^摘要调用：synthetic-provider \/ summary-model/).count(), 1);
-  await completedStatistics;
-  await page.getByRole('button', { name: '生成精简副本', exact: true }).waitFor();
-  assert.equal(await dialog.getByText('精简副本已就绪', { exact: true }).isVisible(), true, 'Refreshing statistics and detail must preserve the result dialog');
-  assert.deepEqual(await page.evaluate(() => __openCalls), [], 'Completion must not navigate or continue by itself');
-  assert.equal(requests.filter(item => item.method === 'POST').length, 1, 'Only the explicit start is allowed');
-  await dialog.getByRole('button', { name: '关闭', exact: true }).click();
-  assert.equal(await dialog.count(), 0);
-  await selectTab(page, '概览');
-  await page.getByRole('region', { name: '缓存专项统计' }).getByText('3,600 tok', { exact: true }).waitFor();
+  assert.equal(await page.getByRole('button', { name: '生成精简副本', exact: true }).count(), 0);
+  const button = page.getByRole('button', { name: '忽略该会话', exact: true });
+  await button.evaluate(node => { node.click(); node.click(); });
+  await page.getByRole('button', { name: '恢复该会话检查', exact: true }).waitFor();
+  assert.deepEqual([...state.ignored], ['main']);
+  assert.equal(requests.filter(item => item.path.endsWith('/sessions/ignored') && item.method === 'POST').length, 1);
+  assert.equal(requests.some(item => item.path.includes('/operations/')), false);
+  await page.evaluate(() => __render());
+  await selectTab(page, '设置');
+  const ignored = page.getByRole('region', { name: '已忽略会话', exact: true });
+  await ignored.getByText('main', { exact: true }).waitFor();
+  await ignored.getByRole('button', { name: '恢复该会话检查', exact: true }).click();
+  await ignored.getByText('没有已忽略会话', { exact: true }).waitFor();
+  assert.equal(state.ignored.size, 0);
   await selectTab(page, '会话明细');
-  await page.getByRole('button', { name: '生成精简副本', exact: true }).click();
-  await dialog.getByText('精简副本已就绪', { exact: true }).waitFor();
-  assert.equal(requests.filter(item => item.path.endsWith('/operations/start')).length, 1, 'Reopening a completed operation must only read its result');
-  await dialog.getByRole('button', { name: '打开副本，手动继续', exact: true }).click();
-  assert.deepEqual(await page.evaluate(() => __openCalls), ['synthetic-branch']);
-  assert.equal(requests.filter(item => item.method === 'POST').length, 1, 'Opening the result must not send a prompt');
-  state.job = { ...state.job, id: 'operation-two', state: 'prepared', branchId: null, summaryCalls: [] };
-  await page.getByRole('button', { name: '生成精简副本', exact: true }).click();
-  await dialog.getByRole('button', { name: '创建副本并生成摘要', exact: true }).click();
-  const cancelledStatistics = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/dashboard'));
-  await dialog.getByRole('button', { name: '取消生成', exact: true }).click();
-  await dialog.getByText('操作已取消', { exact: true }).waitFor();
-  await cancelledStatistics;
-  await page.getByRole('button', { name: '生成精简副本', exact: true }).waitFor();
-  assert.equal(await dialog.getByText('操作已取消', { exact: true }).isVisible(), true, 'Refreshing statistics after cancellation must preserve the cancelled result');
-  assert.equal(requests.filter(item => item.path.endsWith('/operations/cancel')).length, 1);
-  assert.equal(requests.filter(item => item.path.endsWith('/operations/start')).length, 2);
+  await page.getByRole('button', { name: '忽略该会话', exact: true }).waitFor();
+  assert.deepEqual(errors, []);
+});
+
+test('browser next: failed ignore changes stay visible and can be retried', async t => {
+  let fail = true;
+  const api = async ({ url, request, response, json }) => {
+    if (fail && url.pathname.endsWith('/sessions/ignored') && request.method === 'POST') {
+      json(response, { error: '合成持久化失败' }, 503); return true;
+    }
+    return false;
+  };
+  const { page, state, errors } = await fixture(t, { api });
+  await selectTab(page, '会话明细');
+  await page.getByRole('button', { name: '忽略该会话', exact: true }).click();
+  await page.getByRole('alert').getByText('合成持久化失败', { exact: true }).waitFor();
+  assert.equal(state.ignored.size, 0);
+  fail = false;
+  await page.getByRole('button', { name: '忽略该会话', exact: true }).click();
+  await page.getByRole('button', { name: '恢复该会话检查', exact: true }).waitFor();
+  assert.deepEqual([...state.ignored], ['main']);
   assert.deepEqual(errors, []);
 });
 

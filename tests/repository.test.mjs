@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -65,7 +65,7 @@ test('dismissal is bound to its session and restores from metadata-only state', 
     assert.equal((await repo.session('second')).warnings[0].dismissed, false);
     const raw = await readFile(statePath, 'utf8');
     const state = JSON.parse(raw);
-    assert.deepEqual(Object.keys(state).sort(), ['dismissed', 'version']);
+    assert.deepEqual(Object.keys(state).sort(), ['dismissed', 'ignoredSessions', 'version']);
     assert.equal(state.dismissed.length, 1);
     assert.ok(!raw.includes('old old old'));
     await repo.dispose();
@@ -77,6 +77,37 @@ test('dismissal is bound to its session and restores from metadata-only state', 
     assert.equal(second.warnings[0].dismissed, false);
     await restored.dispose();
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('ignored sessions persist independently of analysis, migrate v1 and retain concurrent dismissals', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'cache-helper-ignore-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const statePath = join(directory, 'web-state.json');
+  await writeFile(statePath, JSON.stringify({ version: 1, dismissed: ['old:warning'] }));
+  const ctx = context([warnedSession('first'), warnedSession('second')]);
+  const config = settings({ persistState: true, persistAnalysisCache: false, statePath });
+  const repo = new SessionRepository(ctx, config);
+  await repo.init();
+  const first = await repo.session('first');
+  await Promise.all([
+    repo.setIgnored('first', true),
+    repo.dismiss({ sessionId: 'first', id: first.warnings[0].id, dismissed: true }),
+  ]);
+  assert.equal(repo.isIgnored('first'), true);
+  assert.equal(repo.isIgnored('second'), false);
+  const saved = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(saved.version, 2);
+  assert.deepEqual(saved.ignoredSessions, ['first']);
+  assert.equal(saved.dismissed.length, 2);
+  await repo.dispose();
+  const restarted = new SessionRepository(ctx, config);
+  await restarted.init();
+  assert.equal(restarted.isIgnored('first'), true);
+  assert.equal((await restarted.session('first')).warnings[0].dismissed, true);
+  await restarted.setIgnored('first', false);
+  assert.deepEqual(restarted.ignoredSessions(), []);
+  await assert.rejects(restarted.setIgnored('', true), { status: 400 });
+  await restarted.dispose();
 });
 
 test('maxEvents rejects oversized live histories as well as persisted histories', async () => {

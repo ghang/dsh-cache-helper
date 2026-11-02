@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldImmediate } from 'node:timers/promises';
 
 export const FACT_CACHE_SCHEMA = 1;
-export const ADAPTER_VERSION = 'deepseek-messages-text-v1';
+export const ADAPTER_VERSION = 'deepseek-messages-attachments-v2';
 const digest = value => createHash('sha256').update(value).digest('hex');
 const finite = value => Number.isSafeInteger(value) && value >= 0;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -176,11 +176,11 @@ function validFacts(facts, eventCount) {
     }
     const proof = call.inputProof;
     if (!proof || typeof proof.comparable !== 'boolean'
-      || !keys(proof, ['comparable', 'unknown', 'provider', 'model', 'chars', 'textHash', 'historyChars', 'historyHash', 'systemHash', 'fingerprint', 'toolHashes'])
+      || !keys(proof, ['comparable', 'unknown', 'provider', 'model', 'chars', 'textChars', 'textHash', 'historyChars', 'historyHash', 'systemHash', 'fingerprint', 'toolHashes'])
       || !nullable(proof.provider, text) || !nullable(proof.model, text)
       || !optional(proof.unknown, text)) return false;
     if (!proof.comparable && !keys(proof, ['comparable', 'unknown', 'provider', 'model'])) return false;
-    if (proof.comparable && (!finite(proof.chars) || !finite(proof.historyChars)
+    if (proof.comparable && (!finite(proof.chars) || !finite(proof.textChars) || !finite(proof.historyChars)
       || ![proof.textHash, proof.historyHash, proof.systemHash, proof.fingerprint].every(hex)
       || proof.toolHashes !== null && (!Array.isArray(proof.toolHashes) || proof.toolHashes.length > 128
         || proof.toolHashes.some(tool => !keys(tool, ['name', 'hash']) || typeof tool.name !== 'string' || tool.name.length > 256 || !hex(tool.hash))))) return false;
@@ -214,7 +214,8 @@ export class FactCache {
     const handle = await open(join(this.directory, file), constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const stat = await handle.stat();
-      if (!stat.isFile() || stat.size > this.budget.maxEntryBytes || (stat.mode & 0o077) !== 0) throw new Error('cache-entry-limit-or-permissions');
+      if (!stat.isFile() || stat.size > this.budget.maxEntryBytes
+        || process.platform !== 'win32' && (stat.mode & 0o077) !== 0) throw new Error('cache-entry-limit-or-permissions');
       return { value: JSON.parse(await handle.readFile('utf8')), stat };
     } finally { await handle.close(); }
   }

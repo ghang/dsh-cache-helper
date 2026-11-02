@@ -1,4 +1,4 @@
-import { readFile, mkdir, writeFile, rename } from 'node:fs/promises';
+import { readFile, mkdir, writeFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
@@ -40,6 +40,7 @@ const changed = () => Object.assign(new Error('分析读取期间会话来源发
 /** Read through the host backend; cache only derived metrics, never another request body. */
 export class SessionRepository {
   #dismissed = new Set();
+  #ignored = new Set();
   #write = Promise.resolve();
   #dashboard;
   #dashboardAt = 0;
@@ -103,12 +104,51 @@ export class SessionRepository {
     if (this.config.persistState === false) return;
     try {
       const state = JSON.parse(await readFile(this.statePath, 'utf8'));
-      if (state.version === 1 && Array.isArray(state.dismissed)) {
+      if ([1, 2].includes(state.version) && Array.isArray(state.dismissed)) {
         for (const id of state.dismissed) if (typeof id === 'string') this.#dismissed.add(id);
+        if (state.version === 2 && Array.isArray(state.ignoredSessions)) {
+          for (const id of state.ignoredSessions.slice(0, 10000)) {
+            if (typeof id === 'string' && id.length && id.length <= 200 && !/[\x00-\x1f\x7f]/.test(id)) this.#ignored.add(id);
+          }
+        }
       }
     } catch (error) {
-      if (error.code !== 'ENOENT') this.ctx.logger?.warn?.('cache-helper: cannot read dismissal state; Session metrics remain available');
+      if (error.code !== 'ENOENT') this.ctx.logger?.warn?.('cache-helper: cannot read UI state; Session metrics remain available');
     }
+  }
+
+  isIgnored(sessionId) { return this.#ignored.has(sessionId); }
+  ignoredSessions() { return [...this.#ignored]; }
+
+  async #mutateState(update) {
+    const operation = this.#write.catch(() => {}).then(async () => {
+      const dismissed = new Set(this.#dismissed);
+      const ignored = new Set(this.#ignored);
+      update({ dismissed, ignored });
+      if (this.config.persistState !== false) {
+        const state = JSON.stringify({ version: 2, dismissed: [...dismissed].slice(-10000), ignoredSessions: [...ignored] });
+        await mkdir(dirname(this.statePath), { recursive: true });
+        const temp = `${this.statePath}.${randomUUID()}.tmp`;
+        try {
+          await writeFile(temp, state, { mode: 0o600 });
+          await rename(temp, this.statePath);
+        } finally { await rm(temp, { force: true }).catch(() => {}); }
+      }
+      this.#dismissed = dismissed;
+      this.#ignored = ignored;
+    });
+    this.#write = operation;
+    await operation;
+    return { ok: true };
+  }
+
+  async setIgnored(sessionId, ignored) {
+    if (typeof sessionId !== 'string' || !sessionId.length || sessionId.length > 200 || /[\x00-\x1f\x7f]/.test(sessionId)
+      || typeof ignored !== 'boolean') throw Object.assign(new Error('无效的会话忽略设置。'), { status: 400 });
+    return this.#mutateState(state => {
+      ignored ? state.ignored.add(sessionId) : state.ignored.delete(sessionId);
+      if (state.ignored.size > 10000) throw Object.assign(new Error('忽略会话数量已达上限，请先恢复部分会话。'), { status: 400 });
+    });
   }
 
   /** Listing hints use metadata only; unvalidated disk results stay stale. */
@@ -289,19 +329,7 @@ export class SessionRepository {
     const data = await this.session(sessionId);
     if (!data.warnings.some(warning => warning.id === id)) throw Object.assign(new Error('告警不存在。'), { status: 404 });
     const key = `${sessionId}:${id}`;
-    dismissed ? this.#dismissed.add(key) : this.#dismissed.delete(key);
-    if (this.config.persistState !== false) {
-      const state = JSON.stringify({ version: 1, dismissed: [...this.#dismissed].slice(-10000) });
-      const write = this.#write.catch(() => {}).then(async () => {
-        await mkdir(dirname(this.statePath), { recursive: true });
-        const temp = `${this.statePath}.${randomUUID()}.tmp`;
-        await writeFile(temp, state, { mode: 0o600 });
-        await rename(temp, this.statePath);
-      });
-      this.#write = write;
-      await write;
-    }
-    return { ok: true };
+    return this.#mutateState(state => { dismissed ? state.dismissed.add(key) : state.dismissed.delete(key); });
   }
 
   async dashboard(query = {}, { signal } = {}) {

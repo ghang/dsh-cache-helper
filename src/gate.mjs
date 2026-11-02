@@ -10,7 +10,7 @@ export class GateError extends Error {
   }
 }
 
-/** Each waiter owns one immutable candidate. No remembered allow-list or timeout approval. */
+/** Each waiter owns one immutable candidate; expiry never approves a request. */
 export class GateController {
   #pending = new Map();
   #closed = false;
@@ -106,6 +106,14 @@ export class GateController {
       item.finish();
     }
     return { ok: true };
+  }
+
+  check({ sessionId, id, fingerprint }) {
+    this.#prune(sessionId);
+    const item = this.#pending.get(sessionId);
+    if (!item || item.view.id !== id || item.view.fingerprint !== fingerprint || !this.#valid(item))
+      throw new GateError('此确认已过期，或不属于当前请求。', 'CACHE_HELPER_STALE');
+    return structuredClone(item.view);
   }
 
   cancel(sessionId, reason = '会话已关闭，未发送模型请求。') {
